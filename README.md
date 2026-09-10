@@ -42,6 +42,12 @@ To run different LLM models:
 
 ```bash
 ./target/release/ltengine -m gemma3-12b [--model-file /path/to/model.gguf]
+
+# Use a compatible MTP draft model.
+./target/release/ltengine \
+  --model-file /path/to/target.gguf \
+  --mtp-model-file /path/to/mtp-draft.gguf \
+  --mtp-n-max 3
 ```
 
 ## Models
@@ -56,6 +62,28 @@ LTEngine supports any GGUF language model supported by [llama.cpp](https://githu
 | gemma3-27b | 16G       | 18G       | Best translation quality, slowest   |                    |
 
 Memory usage numbers are approximate.
+
+### MTP speculative decoding
+
+MTP speculative decoding can increase generation speed for compatible models.
+It requires a target GGUF and its matching MTP draft GGUF.
+
+Use `--mtp-model-file` to enable MTP.
+Use `--mtp-n-max` to set the maximum draft length from 1 through 16.
+The default draft length is 3.
+
+The Docker image uses `LTENGINE_MTP_MODEL_FILE` and `LTENGINE_MTP_N_MAX` for these options.
+LTEngine checks vocabulary size, type, BOS token, and embedding width during startup.
+
+```yaml
+environment:
+  LTENGINE_MODEL_FILE: /models/gemma-4-12b-it-UD-Q4_K_XL.gguf
+  LTENGINE_MTP_MODEL_FILE: /models/mtp-gemma-4-12b-it-Q8_0.gguf
+  LTENGINE_MTP_N_MAX: 3
+```
+
+Do not set `LTENGINE_MTP_MODEL_FILE` for models that do not support MTP.
+LTEngine uses its normal single-token decode path when this variable is not set.
 
 ### Simple
 

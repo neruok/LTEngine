@@ -10,6 +10,8 @@ services:
     environment:
       HF_HOME: /models
       LTENGINE_MODEL: gemma3-4b  # gemma3-1b | gemma3-4b | gemma3-12b | gemma3-27b
+      # LTENGINE_MTP_MODEL_FILE: /models/mtp-draft.gguf
+      # LTENGINE_MTP_N_MAX: 3
     deploy:
       resources:
         reservations:

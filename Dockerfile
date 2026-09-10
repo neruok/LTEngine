@@ -69,7 +69,8 @@ RUN useradd \
 COPY --from=builder /out/ltengine /usr/local/bin/ltengine
 
 ENV HF_HOME=/models \
-    LTENGINE_MODEL=gemma3-4b
+    LTENGINE_MODEL=gemma3-4b \
+    LTENGINE_MTP_N_MAX=3
 
 VOLUME ["/models"]
 
@@ -77,4 +78,4 @@ EXPOSE 5050
 
 USER ltengine
 
-CMD ["sh", "-c", "set -eu; set -- ltengine --host 0.0.0.0 -m \"$LTENGINE_MODEL\"; if [ -n \"${LTENGINE_MODEL_FILE:-}\" ]; then set -- \"$@\" --model-file \"$LTENGINE_MODEL_FILE\"; fi; exec \"$@\""]
+CMD ["sh", "-c", "set -eu; set -- ltengine --host 0.0.0.0 -m \"$LTENGINE_MODEL\"; if [ -n \"${LTENGINE_MODEL_FILE:-}\" ]; then set -- \"$@\" --model-file \"$LTENGINE_MODEL_FILE\"; fi; if [ -n \"${LTENGINE_MTP_MODEL_FILE:-}\" ]; then set -- \"$@\" --mtp-model-file \"$LTENGINE_MTP_MODEL_FILE\" --mtp-n-max \"$LTENGINE_MTP_N_MAX\"; fi; exec \"$@\""]

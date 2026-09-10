@@ -4,6 +4,7 @@ use actix_web::{
 };
 use actix_multipart::form::{MultipartForm, text::Text as MPText};
 use actix_web_static_files::ResourceFiles;
+use std::path::PathBuf;
 use std::sync::Arc;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
@@ -45,6 +46,14 @@ struct Args {
     /// Path to .gguf model file
     #[arg(long, default_value = "")]
     model_file: String,
+
+    /// Path to a compatible MTP draft .gguf model file
+    #[arg(long, default_value = "")]
+    mtp_model_file: String,
+
+    /// Maximum number of MTP draft tokens per step
+    #[arg(long, default_value_t = 3)]
+    mtp_n_max: i32,
 
     /// Set an API key
     #[arg(long, default_value = "")]
@@ -341,7 +350,15 @@ async fn main() -> std::io::Result<()> {
     
     println!("Loading model: {}", model_path.display());
 
-    let llm = Arc::new(llm::LLM::new(model_path, args.cpu, args.verbose).unwrap_or_else(|err| {
+    let mtp_model_path = (!args.mtp_model_file.is_empty())
+        .then(|| PathBuf::from(&args.mtp_model_file));
+    let llm = Arc::new(llm::LLM::new(
+        model_path,
+        mtp_model_path,
+        args.mtp_n_max,
+        args.cpu,
+        args.verbose,
+    ).unwrap_or_else(|err| {
         eprintln!("Failed to initialize LLM: {}", err);
         std::process::exit(1);
     }));
