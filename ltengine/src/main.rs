@@ -15,6 +15,7 @@ mod models;
 mod llm;
 mod banner;
 mod prompt;
+mod responses;
 
 use languages::{detect_lang, get_language_from_code, LANGUAGES};
 use error_response::ErrorResponse;
@@ -378,6 +379,7 @@ async fn main() -> std::io::Result<()> {
             .service(translate_file)
             .service(detect)
             .service(suggest)
+            .service(responses::create_response)
             .service(ResourceFiles::new("/", generated))
     })
     .bind((host.clone(), port))?
