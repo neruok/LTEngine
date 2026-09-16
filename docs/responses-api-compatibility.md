@@ -26,7 +26,8 @@ section 4 and section 5. The limits of section 5 are part of the claim.
 | Python SDK | `openai` 3.14.1 on Python >= 3.10 |
 | JavaScript SDK | `openai` 7.15.0 on Node >= 22 |
 | Endpoint under test | `POST /v1/responses` on a local LTEngine server |
-| Generation mode | Non-streaming only (`SP-MUST-005`) |
+| Generation mode | Non-streaming and SSE streaming (`stream: true`, RD-17) |
+| Stream transport | `content-type: text/event-stream` for `stream: true` |
 | Upstream service | None. The endpoint uses the loaded local GGUF model (RD-1). |
 | New dependency | None. The smoke tests use the SDK that the test environment provides. |
 
@@ -80,7 +81,7 @@ Status values:
 | SP-MUST-002 | Text `instructions` | Manual `curl`; smoke test request 1 | `PASS (PH-1)` | Roadmap section 6 gate evidence |
 | SP-MUST-003 | Text `input` | Manual `curl`; smoke test request 1 | `PASS (PH-1)` | Roadmap section 6 gate evidence |
 | SP-MUST-004 | Message-array `input` with the standard text roles | Manual `curl`; smoke test request 2 | `PASS (PH-1)` | Roadmap section 6 gate evidence |
-| SP-MUST-005 | Non-streaming generation | Manual `curl` with `stream: true`, which returns a clear error | `PASS (PH-1)` | Roadmap section 6 gate evidence |
+| SP-MUST-005 | Non-streaming generation | Manual `curl` without `stream` and with `stream: false` | `PASS (PH-1)` | Roadmap section 6 gate evidence. `PH-3` added SSE streaming for `stream: true`; section 9 of this file records it. |
 | SP-MUST-006 | OpenAI-shaped response objects | Manual `curl`; smoke test `object` and `output_text` checks; inline unit test `response_shape_has_message_output_and_no_usage` | `PASS (PH-1)` | Roadmap section 6 gate evidence for `object`, `id`, `model`, and `output_text`. The required fields `parallel_tool_calls`, `tool_choice`, and `tools` have the static coverage of section 8 and the live correction run of section 8. |
 | SP-MUST-007 | OpenAI-shaped validation and error responses | Manual `curl` with an invalid body, a body `api_key`, and a bad `model` | `PASS (PH-1)` | Roadmap section 6 gate evidence |
 | SP-MUST-008 | `Authorization: Bearer` with the `--api-key` value | Smoke test wrong-key check; manual `curl` auth check | `PASS (PH-1)` | Roadmap section 6 gate evidence |
@@ -106,13 +107,13 @@ compatibility claim.
 | SP-NEVER-001 | Exact GPT model behavior and exact output equivalence | The endpoint runs the loaded local GGUF model. No output-equivalence claim exists. |
 | SP-NEVER-002 | OpenAI model weights and proprietary model internals | LTEngine ships no OpenAI weight and no OpenAI internal. |
 | SP-NEVER-003 | Hidden chain-of-thought and proprietary reasoning traces | The response carries the generated text only. No reasoning trace is exposed. |
-| SP-NEVER-004 | Exact OpenAI tokenization for a local model | The profile makes no tokenization claim. The first increment emits no `usage` object. |
+| SP-NEVER-004 | Exact OpenAI tokenization for a local model | The profile makes no OpenAI-tokenization claim. The `usage` counts come from the loaded local-model tokenizer (RD-18). |
 | SP-NEVER-005 | OpenAI billing, credits, pricing, and invoices | The profile makes no billing, credit, pricing, or invoice claim. |
 | SP-NEVER-006 | OpenAI service tiers and capacity guarantees | The profile makes no tier and no capacity claim. `run_prompt` serializes inference, and this limit appears in section 6. |
 | SP-NEVER-007 | OpenAI infrastructure, regions, and data-residency guarantees | The profile makes no infrastructure, region, or residency claim. The server is self-hosted. |
 | SP-NEVER-008 | Exact OpenAI moderation and refusal behavior | The profile makes no moderation and no refusal-behavior claim. |
 | SP-NEVER-009 | OpenAI-hosted tool implementations | The endpoint executes no tool. It returns a clear error for an unsupported tool. |
-| SP-NEVER-010 | Fake usage, fake tool execution, and silent unsupported-field handling | The response omits `usage`. An unsupported field returns a clear error. No field is ignored silently. |
+| SP-NEVER-010 | Fake usage, fake tool execution, and silent unsupported-field handling | `usage` carries the exact local-model token counts of RD-18, never an estimate. An unsupported field returns a clear error. No field is ignored silently. |
 | SP-NEVER-011 | Byte-for-byte response parity | The profile claims no byte-for-byte parity. The client checks field values only. |
 | SP-NEVER-012 | An unversioned full OpenAI parity claim | The claim is versioned: compatibility profile version `1`. Section 1 states the limits. |
 
@@ -120,10 +121,16 @@ compatibility claim.
 
 1. `LLM::run_prompt` serializes inference. A concurrent request can fail with
    `LLMError::Busy` after 120 seconds. The profile makes no concurrency claim.
-2. The response omits `usage`. Real token usage is `PH-3` work
-   (`SP-PLANNED-002`). Fake usage is prohibited (`SP-NEVER-010`).
-3. A `stream: true` request returns a clear error. SSE streaming is `PH-3` work
-   (`SP-PLANNED-001`).
+2. `usage` carries the exact token counts of RD-18. `input_tokens` is the
+   length of the chat-templated token-ID vector passed to decode, beginning-of-
+   sequence token included. `output_tokens` counts the emitted non-end-of-
+   generation token IDs. The endpoint omits `usage` when an exact count is
+   unavailable and never estimates (`SP-NEVER-010`).
+3. `stream: true` returns `text/event-stream` in the RD-17 event order with a
+   monotonically increasing `sequence_number`. The SSE body is built after the
+   single generation attempt, so it carries one `response.output_text.delta`
+   that holds the whole text, and every failure happens before the first event.
+   Section 9 records the evidence.
 4. Stored responses, `previous_response_id`, conversations, background work,
    structured output, and function calling are absent. They are `PH-3` through
    `PH-6` work. `SP-MUST-011` covers the clear-error outcome for their fields.
@@ -234,3 +241,81 @@ correction changes no decision outcome beyond the recorded `RD-3` outcome and
 item 2 above. The live rows of section 7 stay the `PH-2` record of the earlier
 scripts. Rows `SP-MUST-006` and `SP-MUST-011` keep their `PH-1` gate status; the
 live correction run adds evidence to those two rows and changes no status.
+
+## 9. `PH-3`: SSE streaming and token usage
+
+The `PH-3` gate result is `PASS`. The phase delivers `SP-PLANNED-001` (SSE text
+streaming) and `SP-PLANNED-002` (real token usage). `RD-17` fixes the event set
+and the event order, `RD-13` fixes the attempt policy, and `RD-18` fixes the
+count source.
+
+Delivered:
+
+1. `stream: true` on `POST /v1/responses` returns `content-type:
+   text/event-stream` with the RD-17 order `response.created`,
+   `response.in_progress`, `response.output_item.added`,
+   `response.content_part.added`, zero or more `response.output_text.delta`,
+   `response.output_text.done`, `response.content_part.done`,
+   `response.output_item.done`, and `response.completed`. Each payload carries
+   its event `type` and a monotonically increasing integer `sequence_number`.
+2. One generation attempt and no retry, no reconnect, and no `Last-Event-ID`
+   behavior (`RD-13`). Replay stays `PH-5` work.
+3. Every failure before the first event uses the normal OpenAI-shaped HTTP error
+   body.
+4. A `usage` object on the non-streaming body and on the `response.completed`
+   event with `input_tokens`, `output_tokens`, and the exact `total_tokens` sum.
+   The counts come from the loaded local-model tokenizer (`RD-18`). The endpoint
+   omits `usage` when an exact count is unavailable and never estimates
+   (`SP-NEVER-010`).
+
+Live evidence, local fixture `http://127.0.0.1:5051/v1`, key `ph1-test-key`,
+loaded model = the full `--model-file` GGUF path:
+
+| Check | Command or request | Result |
+| ----- | ------------------ | ------ |
+| Stream transport | `curl -N` with `stream: true` | `PASS`: HTTP 200 with `content-type: text/event-stream` |
+| Event order | Parse the `event:` lines of the stream body | `PASS`: the nine RD-17 events in order, one delta, sequence numbers `0` through `8`, and every payload `type` equals its `event:` line |
+| Stream usage | `usage` of the `response.completed` event | `PASS`: `input_tokens` 15, `output_tokens` 3, `total_tokens` 18 |
+| Non-streaming usage | `curl` with no `stream` and with `stream: false` | `PASS`: JSON body with the same `15`/`3`/`18` |
+| Exact sum | `input_tokens + output_tokens == total_tokens` | `PASS` for both responses |
+| Prompt-length growth | A longer `instructions` and `input` | `PASS`: `input_tokens` 36, `output_tokens` 73, `total_tokens` 109 |
+| Pre-first-event failure | `stream: true` with a bad `model`, a wrong bearer token, a body `api_key`, and a malformed body | `PASS`: HTTP 400 or 401 with the OpenAI-shaped JSON error, and no `text/event-stream` |
+| Unit tests | `CARGO_NET_OFFLINE=true cargo test` | `PASS`: 23 tests passed, 0 failed. The tests `stream_body_follows_the_rd17_order_with_increasing_sequence_numbers`, `stream_body_sets_the_content_type_and_echoes_metadata`, `accepts_stream_true_and_selects_the_sse_body`, `response_shape_has_message_output_and_usage`, and `usage_total_is_the_exact_sum_and_eog_is_not_counted` cover the new shape. |
+| Release build | `CARGO_NET_OFFLINE=true cargo build --release` | `PASS`: exit 0 |
+| MTP pair load | Server with `--mtp-model-file` and `--mtp-n-max 2`, target file `gemma-4-E2B_q4_0-it.gguf`, draft file `gemma-4-E2B-it-qat-assistant-MTP-Q8_0.gguf` | `PASS`: log `ltengine: MTP draft model loaded`, then HTTP 200 |
+| MTP draft acceptance | Server log of the same request | `PASS`: `ltengine: MTP proposed 34 tokens, accepted 34`. The accepted total is above 0, so the accepted draft-token counting ran |
+| MTP output and usage equality | The same request against the target-only server and against the MTP server | `PASS`: both return the text `1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20`, and both carry `input_tokens` 53, `output_tokens` 50, and `total_tokens` 103 |
+| MTP stream parity | `stream: true` against the MTP server | `PASS`: the RD-17 order with sequence numbers `0` through `8`, one delta that holds the whole text, and the same `53`/`50`/`103` usage in `response.completed` |
+
+The MTP rows use this request:
+
+```json
+{"model":"/root/.cache/ltengine-ph3-mtp/gemma-4-E2B_q4_0-it.gguf","instructions":"You are a helpful assistant.","input":"Write the integers from 1 to 20 separated by single spaces. Output only the numbers."}
+```
+
+The MTP rows use this model pair:
+
+| Role | Path | Byte size |
+| ---- | ---- | --------- |
+| Target | `/root/.cache/ltengine-ph3-mtp/gemma-4-E2B_q4_0-it.gguf` | 3,349,516,256 |
+| Draft | `/root/.cache/ltengine-ph3-mtp/gemma-4-E2B-it-qat-assistant-MTP-Q8_0.gguf` | 97,835,456 |
+
+The MTP rows use a different request and a different model from the rows above
+them. Compare each row with its own request only. The `output_tokens` value of
+50 holds the accepted draft tokens, because the MTP server counted them
+(`RD-18`).
+
+Limits of this record:
+
+1. The SSE body is built after the single generation attempt, so it carries one
+   delta that holds the whole text. RD-17 permits zero or more delta events.
+   This profile does not claim incremental token delivery.
+2. No independent tokenizer implementation is available offline, so the counts
+   were checked by the exact-sum identity, by the agreement of the streamed and
+   the non-streaming request on the same prompt, and by prompt-length growth,
+   not against a second tokenizer.
+3. `response.failed` is not emitted, because every failure happens before the
+   first event (`RD-13`).
+
+This profile claims no full OpenAI parity (`SP-NEVER-012`). The stream claim
+covers the text scope of section 4 only.

@@ -1,9 +1,12 @@
-//! Non-streaming `POST /v1/responses` (roadmap PH-1).
+//! `POST /v1/responses` (roadmap PH-1 and PH-3).
 //!
-//! The route is a non-streaming text adapter over `LLM::run_prompt`. It is not
-//! an OpenAI proxy: no upstream call, no second decode path. Only this route
-//! uses the OpenAI-shaped nested error body; the existing LibreTranslate routes
-//! keep their flat `{"error": "<string>"}` body.
+//! The route is a text adapter over `LLM::run_prompt_usage`. It is not an
+//! OpenAI proxy: no upstream call, no second decode path. Only this route uses
+//! the OpenAI-shaped nested error body; the existing LibreTranslate routes keep
+//! their flat `{"error": "<string>"}` body.
+//!
+//! `stream: true` answers with `text/event-stream` (PH-3, RD-17). The body is one
+//! generation attempt and carries the exact token usage of RD-18.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -205,16 +208,14 @@ fn loaded_model_identifier(args: &Args) -> String {
 }
 
 /// Validate every supported-statefulness and model choice before generation.
+///
+/// `stream` is not validated here: `stream: true` selects the SSE response of
+/// `build_stream_body` (RD-17). Every rejection below happens before the first
+/// event, so it uses the normal OpenAI-shaped HTTP error (RD-13).
 fn validate(
     request: &CreateRequest,
     loaded_model: &str,
 ) -> Result<(String, String), (u16, String)> {
-    if request.stream == Some(true) {
-        return Err((
-            400,
-            "streaming is not supported: use stream false".to_string(),
-        ));
-    }
     if let Some(model) = &request.model {
         if model != loaded_model {
             return Err((
@@ -306,38 +307,239 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// OpenAI-shaped non-streaming response. `usage` is omitted on purpose: real
-/// token usage is PH-3 work and fake usage is prohibited (SP-NEVER-010).
-/// `parallel_tool_calls`, `tool_choice`, and `tools` are the truthful values of
-/// the text-only route: it offers no tool and calls no tool. `metadata` echoes
-/// the accepted request value, or `null` when the request carried none.
-fn build_response(
+/// One `output_text` content part.
+fn output_text_part(text: &str) -> serde_json::Value {
+    serde_json::json!({"type": "output_text", "text": text, "annotations": []})
+}
+
+/// One assistant `message` output item. `text` is `None` while the item is in
+/// progress, because its content part arrives in a later event.
+fn message_item(item_id: &str, status: &str, text: Option<&str>) -> serde_json::Value {
+    let content = match text {
+        Some(text) => serde_json::json!([output_text_part(text)]),
+        None => serde_json::json!([]),
+    };
+    serde_json::json!({
+        "id": item_id,
+        "type": "message",
+        "status": status,
+        "role": "assistant",
+        "content": content,
+    })
+}
+
+/// The exact `usage` object of RD-18. `total_tokens` is the exact sum of the two
+/// exact counts. No value is an estimate (`SP-NEVER-010`).
+fn usage_json(usage: &llm::TokenUsage) -> serde_json::Value {
+    serde_json::json!({
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "total_tokens": usage.total_tokens(),
+    })
+}
+
+/// The OpenAI-shaped response object, shared by the non-streaming body and the
+/// `response.completed` and `response.in_progress` events.
+fn response_object(
+    id: &str,
+    created_at: u64,
+    status: &str,
     model: &str,
-    text: &str,
     metadata: Option<&serde_json::Value>,
+    output: serde_json::Value,
+    usage: serde_json::Value,
 ) -> serde_json::Value {
     serde_json::json!({
-        "id": new_id("resp_"),
+        "id": id,
         "object": "response",
-        "created_at": now_secs(),
-        "status": "completed",
+        "created_at": created_at,
+        "status": status,
         "model": model,
         "metadata": metadata,
         "parallel_tool_calls": false,
         "tool_choice": "none",
         "tools": [],
-        "output": [{
-            "id": new_id("msg_"),
-            "type": "message",
-            "status": "completed",
-            "role": "assistant",
-            "content": [{
-                "type": "output_text",
-                "text": text,
-                "annotations": [],
-            }],
-        }],
+        "output": output,
+        "usage": usage,
     })
+}
+
+/// OpenAI-shaped non-streaming response. `usage` carries the exact counts of
+/// the one generation (PH-3, RD-18). `parallel_tool_calls`, `tool_choice`, and
+/// `tools` are the truthful values of the text-only route: it offers no tool and
+/// calls no tool. `metadata` echoes the accepted request value, or `null` when
+/// the request carried none.
+fn build_response(
+    model: &str,
+    text: &str,
+    metadata: Option<&serde_json::Value>,
+    usage: &llm::TokenUsage,
+) -> serde_json::Value {
+    response_object(
+        &new_id("resp_"),
+        now_secs(),
+        "completed",
+        model,
+        metadata,
+        serde_json::json!([message_item(&new_id("msg_"), "completed", Some(text))]),
+        usage_json(usage),
+    )
+}
+
+/// Append one SSE frame. The frame carries the OpenAI event name line and the
+/// JSON payload line. The payload carries its event `type` and the next
+/// `sequence_number` (RD-17).
+fn push_event(
+    body: &mut String,
+    sequence: &mut u32,
+    event_type: &str,
+    mut payload: serde_json::Value,
+) {
+    let map = payload
+        .as_object_mut()
+        .expect("an event payload is a JSON object");
+    map.insert("type".to_string(), serde_json::Value::from(event_type));
+    map.insert(
+        "sequence_number".to_string(),
+        serde_json::Value::from(*sequence),
+    );
+    *sequence += 1;
+    body.push_str("event: ");
+    body.push_str(event_type);
+    body.push_str("\ndata: ");
+    body.push_str(&payload.to_string());
+    body.push_str("\n\n");
+}
+
+/// Build the SSE body of a successful `stream: true` request (RD-17).
+///
+/// The event order is exactly `response.created`, `response.in_progress`,
+/// `response.output_item.added`, `response.content_part.added`, zero or more
+/// `response.output_text.delta`, `response.output_text.done`,
+/// `response.content_part.done`, `response.output_item.done`, and
+/// `response.completed`. `PH-3` makes one generation attempt and emits no
+/// `response.failed`, because every failure happens before the first event
+/// (RD-13).
+///
+/// `ponytail:` the body is built after the single generation attempt, so it
+/// carries one delta with the whole text. RD-17 permits zero or more delta
+/// events, and `clean_output` can retract text at the end, so the whole text is
+/// the only safe delta. Emit finer deltas when the decode path can hand out text
+/// that the cleanup will not retract.
+fn build_stream_body(
+    model: &str,
+    text: &str,
+    metadata: Option<&serde_json::Value>,
+    usage: &llm::TokenUsage,
+) -> String {
+    let response_id = new_id("resp_");
+    let item_id = new_id("msg_");
+    let created_at = now_secs();
+    let output_index = 0;
+    let content_index = 0;
+    let in_progress = response_object(
+        &response_id,
+        created_at,
+        "in_progress",
+        model,
+        metadata,
+        serde_json::json!([]),
+        serde_json::Value::Null,
+    );
+    let completed = response_object(
+        &response_id,
+        created_at,
+        "completed",
+        model,
+        metadata,
+        serde_json::json!([message_item(&item_id, "completed", Some(text))]),
+        usage_json(usage),
+    );
+
+    let mut sequence = 0_u32;
+    let mut body = String::new();
+    push_event(
+        &mut body,
+        &mut sequence,
+        "response.created",
+        serde_json::json!({"response": in_progress}),
+    );
+    push_event(
+        &mut body,
+        &mut sequence,
+        "response.in_progress",
+        serde_json::json!({"response": in_progress}),
+    );
+    push_event(
+        &mut body,
+        &mut sequence,
+        "response.output_item.added",
+        serde_json::json!({
+            "output_index": output_index,
+            "item": message_item(&item_id, "in_progress", None),
+        }),
+    );
+    push_event(
+        &mut body,
+        &mut sequence,
+        "response.content_part.added",
+        serde_json::json!({
+            "item_id": item_id,
+            "output_index": output_index,
+            "content_index": content_index,
+            "part": output_text_part(""),
+        }),
+    );
+    push_event(
+        &mut body,
+        &mut sequence,
+        "response.output_text.delta",
+        serde_json::json!({
+            "item_id": item_id,
+            "output_index": output_index,
+            "content_index": content_index,
+            "delta": text,
+            "logprobs": [],
+        }),
+    );
+    push_event(
+        &mut body,
+        &mut sequence,
+        "response.output_text.done",
+        serde_json::json!({
+            "item_id": item_id,
+            "output_index": output_index,
+            "content_index": content_index,
+            "text": text,
+        }),
+    );
+    push_event(
+        &mut body,
+        &mut sequence,
+        "response.content_part.done",
+        serde_json::json!({
+            "item_id": item_id,
+            "output_index": output_index,
+            "content_index": content_index,
+            "part": output_text_part(text),
+        }),
+    );
+    push_event(
+        &mut body,
+        &mut sequence,
+        "response.output_item.done",
+        serde_json::json!({
+            "output_index": output_index,
+            "item": message_item(&item_id, "completed", Some(text)),
+        }),
+    );
+    push_event(
+        &mut body,
+        &mut sequence,
+        "response.completed",
+        serde_json::json!({"response": completed}),
+    );
+    body
 }
 
 #[post("/v1/responses")]
@@ -368,11 +570,22 @@ pub async fn create_response(
         Err((status, message)) => return error_json(status, message),
     };
 
-    match llm.run_prompt(system, user) {
-        Ok(text) => HttpResponse::Ok().json(build_response(
+    // `RD-25` reasoning support is added with the request field; this commit
+    // only threads the parameter through the generation path.
+    match llm.run_prompt_usage(system, user, &llm::Reasoning::default()) {
+        Ok((text, usage)) if request.stream == Some(true) => HttpResponse::Ok()
+            .content_type("text/event-stream")
+            .body(build_stream_body(
+                &loaded_model,
+                &text,
+                request.metadata.as_ref(),
+                &usage,
+            )),
+        Ok((text, usage)) => HttpResponse::Ok().json(build_response(
             &loaded_model,
             &text,
             request.metadata.as_ref(),
+            &usage,
         )),
         Err(err) => {
             let status = match err.downcast_ref::<llm::LLMError>() {
@@ -388,6 +601,7 @@ pub async fn create_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::TokenUsage;
     use clap::Parser;
 
     fn parse(json: &str) -> CreateRequest {
@@ -554,11 +768,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_stream_true() {
+    fn accepts_stream_true_and_selects_the_sse_body() {
+        // PH-3 replaced the PH-1 rejection of `stream: true` with SSE output.
         let request = parse(r#"{"model":"gemma3-4b","input":"hi","stream":true}"#);
-        let (status, message) = validate(&request, "gemma3-4b").unwrap_err();
-        assert_eq!(status, 400);
-        assert!(message.contains("stream"));
+        assert!(validate(&request, "gemma3-4b").is_ok());
+        assert!(!build_stream_body("gemma3-4b", "hi", None, &TokenUsage::default()).is_empty());
     }
 
     #[test]
@@ -651,8 +865,12 @@ mod tests {
     }
 
     #[test]
-    fn response_shape_has_message_output_and_no_usage() {
-        let body = build_response("gemma3-4b", "hello", None);
+    fn response_shape_has_message_output_and_usage() {
+        let usage = TokenUsage {
+            input_tokens: 7,
+            output_tokens: 3,
+        };
+        let body = build_response("gemma3-4b", "hello", None, &usage);
         assert_eq!(body["object"], "response");
         assert_eq!(body["status"], "completed");
         assert_eq!(body["model"], "gemma3-4b");
@@ -660,26 +878,126 @@ mod tests {
         assert_eq!(body["output"][0]["content"][0]["type"], "output_text");
         assert_eq!(body["output"][0]["content"][0]["text"], "hello");
         assert!(body["id"].as_str().unwrap().starts_with("resp_"));
-        assert!(body.get("usage").is_none());
+        // PH-3: the exact RD-18 counts, never an estimate.
+        assert_eq!(body["usage"]["input_tokens"], 7);
+        assert_eq!(body["usage"]["output_tokens"], 3);
+        assert_eq!(body["usage"]["total_tokens"], 10);
         // The required fields of the text-only route are always present.
         assert_eq!(body["parallel_tool_calls"], false);
         assert_eq!(body["tool_choice"], "none");
         assert_eq!(body["tools"].as_array().map(Vec::len), Some(0));
     }
 
+    /// Parse an SSE body into its JSON payloads. Each frame must carry a `data:`
+    /// line whose payload `type` equals the `event:` line (RD-17).
+    fn parse_sse(body: &str) -> Vec<serde_json::Value> {
+        body.split("\n\n")
+            .filter(|frame| !frame.trim().is_empty())
+            .map(|frame| {
+                let name = frame
+                    .lines()
+                    .find_map(|line| line.strip_prefix("event: "))
+                    .expect("frame has an event line");
+                let data = frame
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data: "))
+                    .expect("frame has a data line");
+                let payload: serde_json::Value =
+                    serde_json::from_str(data).expect("payload is JSON");
+                assert_eq!(payload["type"], name, "payload type matches the event name");
+                payload
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stream_body_follows_the_rd17_order_with_increasing_sequence_numbers() {
+        let usage = TokenUsage {
+            input_tokens: 4,
+            output_tokens: 2,
+        };
+        let body = build_stream_body("gemma3-4b", "hello", None, &usage);
+        let events = parse_sse(&body);
+        let types: Vec<&str> = events
+            .iter()
+            .map(|event| event["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            types,
+            [
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+        for (index, event) in events.iter().enumerate() {
+            assert_eq!(event["sequence_number"], index);
+        }
+
+        // The delta, the part, the item, and the completed response agree.
+        let item_id = events[4]["item_id"].as_str().unwrap();
+        assert_eq!(events[4]["delta"], "hello");
+        assert_eq!(events[5]["text"], "hello");
+        assert_eq!(events[6]["part"]["text"], "hello");
+        assert_eq!(events[7]["item"]["id"], item_id);
+        assert_eq!(events[3]["part"]["type"], "output_text");
+        assert_eq!(events[2]["item"]["status"], "in_progress");
+        assert_eq!(events[8]["response"]["status"], "completed");
+        assert_eq!(events[8]["response"]["model"], "gemma3-4b");
+        assert_eq!(events[8]["response"]["output"][0]["id"], item_id);
+        assert_eq!(events[8]["response"]["usage"]["input_tokens"], 4);
+        assert_eq!(events[8]["response"]["usage"]["output_tokens"], 2);
+        assert_eq!(events[8]["response"]["usage"]["total_tokens"], 6);
+        // The stream carries no failure event: PH-3 fails before the first
+        // event instead (RD-13).
+        assert!(!types.contains(&"response.failed"));
+        assert!(!types.contains(&"response.incomplete"));
+    }
+
+    #[test]
+    fn stream_body_sets_the_content_type_and_echoes_metadata() {
+        let metadata = serde_json::json!({"a": "b"});
+        let usage = TokenUsage {
+            input_tokens: 1,
+            output_tokens: 1,
+        };
+        let body = build_stream_body("gemma3-4b", "x", Some(&metadata), &usage);
+        let events = parse_sse(&body);
+        assert_eq!(
+            events[0]["response"]["metadata"],
+            serde_json::json!({"a": "b"})
+        );
+        assert_eq!(
+            events[8]["response"]["metadata"],
+            serde_json::json!({"a": "b"})
+        );
+        assert_eq!(events[0]["response"]["status"], "in_progress");
+        assert!(events[0]["response"]["usage"].is_null());
+        // The two SSE frames share one response identifier.
+        assert_eq!(events[0]["response"]["id"], events[8]["response"]["id"]);
+    }
+
     #[test]
     fn response_echoes_metadata_or_null() {
+        let usage = TokenUsage::default();
         let metadata = serde_json::json!({"a": "b"});
-        let echoed = build_response("gemma3-4b", "x", Some(&metadata));
+        let echoed = build_response("gemma3-4b", "x", Some(&metadata), &usage);
         assert_eq!(echoed["metadata"], serde_json::json!({"a": "b"}));
-        let absent = build_response("gemma3-4b", "x", None);
+        let absent = build_response("gemma3-4b", "x", None, &usage);
         assert!(absent["metadata"].is_null());
     }
 
     #[test]
     fn response_ids_are_unique_and_prefixed() {
-        let first = build_response("gemma3-4b", "a", None);
-        let second = build_response("gemma3-4b", "b", None);
+        let usage = TokenUsage::default();
+        let first = build_response("gemma3-4b", "a", None, &usage);
+        let second = build_response("gemma3-4b", "b", None, &usage);
         let first_id = first["id"].as_str().unwrap();
         let second_id = second["id"].as_str().unwrap();
         assert!(first_id.starts_with("resp_"));

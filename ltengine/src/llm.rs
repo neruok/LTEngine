@@ -21,6 +21,34 @@ pub enum LLMError {
     Busy,
 }
 
+/// Exact token counts of one generation (RD-18).
+///
+/// `input_tokens` counts the token IDs of the fully chat-templated prompt,
+/// including the beginning-of-sequence token. `output_tokens` counts the
+/// generated token IDs, excluding the end-of-generation token and including the
+/// accepted MTP draft tokens and the sampled tokens. Neither field is an
+/// estimate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+}
+
+impl TokenUsage {
+    /// The exact sum of the two counts (RD-18).
+    pub fn total_tokens(&self) -> u32 {
+        self.input_tokens + self.output_tokens
+    }
+
+    /// Count one generated token ID. The end-of-generation token is never
+    /// counted (RD-18).
+    fn record_output(&mut self, is_eog: bool) {
+        if !is_eog {
+            self.output_tokens += 1;
+        }
+    }
+}
+
 /// Query (free_mib, total_mib) on device 0. Works for CUDA and Vulkan; None for CPU builds.
 #[allow(unused_mut)]
 fn vram_mib() -> Option<(u64, u64)> {
@@ -257,20 +285,24 @@ impl LLM {
         Ok(LLMContext{ llm: self, ctx, ctx_size })
     }
 
+    /// Run one generation and return the cleaned text.
+    ///
+    /// Kept for the existing callers (`/translate`). It delegates to
+    /// [`LLM::run_prompt_usage`], so every caller uses one decode path
+    /// (`CC-4`).
     pub fn run_prompt(&self, system: String, user: String) -> Result<String>{
-        self.run_prompt_reasoning(system, user, &Reasoning::default())
+        self.run_prompt_usage(system, user, &Reasoning::default())
+            .map(|(text, _usage)| text)
     }
 
-    /// Run one generation with explicit reasoning controls (`RD-28`).
-    ///
-    /// [`LLM::run_prompt`] delegates with [`Reasoning::default`], so every
-    /// caller that predates `RD-28` keeps its behavior.
-    pub fn run_prompt_reasoning(
+    /// Run one generation and return the cleaned text with the exact token
+    /// counts of RD-18, under explicit reasoning controls (`RD-28`).
+    pub fn run_prompt_usage(
         &self,
         system: String,
         user: String,
         reasoning: &Reasoning<'_>,
-    ) -> Result<String> {
+    ) -> Result<(String, TokenUsage)>{
         let messages = [
             LlamaChatMessage::new("user".to_string(), format!("{system}\n\n{user}"))
                 .context("Failed to build chat message")?
@@ -300,6 +332,9 @@ impl LLM {
         // for token in &tokens_list {
         //     eprint!("{} {} | ", self.model.token_to_str(*token, Special::Tokenize)?, token);
         // }
+        // RD-18: the tokens that reach decode are the count, BOS included.
+        let input_tokens = u32::try_from(tokens_list.len())
+            .context("prompt token count does not fit in u32")?;
         let ctx_size: i32 = tokens_list.len() as i32 * 3;
         // Lock before create_context: context allocation uses GPU resources and
         // two concurrent allocations corrupt each other even before inference starts.
@@ -309,15 +344,20 @@ impl LLM {
         // one at a time.
         let _lock = self.prompt_lock.try_lock_for(Duration::from_secs(120))
             .ok_or(LLMError::Busy)?;
-        if self.mtp_model.is_some() || self.self_mtp {
-            self.process_mtp(tokens_list, ctx_size)
+        let (text, output_tokens) = if self.mtp_model.is_some() || self.self_mtp {
+            self.process_mtp(tokens_list, ctx_size)?
         } else {
             let mut ctx = self.create_context(ctx_size)?;
-            ctx.process(tokens_list)
-        }
+            ctx.process(tokens_list)?
+        };
+        Ok((text, TokenUsage { input_tokens, output_tokens }))
     }
 
-    fn process_mtp(&self, tokens_list: Vec<LlamaToken>, output_limit: i32) -> Result<String> {
+    fn process_mtp(
+        &self,
+        tokens_list: Vec<LlamaToken>,
+        output_limit: i32,
+    ) -> Result<(String, u32)> {
         // The draft model is the separate `--mtp-model-file` model when present,
         // and otherwise the target model's own nextn/MTP head.
         let mtp_model = self.mtp_model.as_ref().unwrap_or(&self.model);
@@ -368,11 +408,14 @@ impl LLM {
         let mut n_past = batch.n_tokens();
         let mut proposed = 0_usize;
         let mut accepted_total = 0_usize;
+        let mut usage = TokenUsage::default();
 
         while n_past <= output_limit {
             if self.model.is_eog_token(token) {
                 break;
             }
+            // The check above excluded the end-of-generation token.
+            usage.record_output(false);
             append_token(&self.model, token, &mut decoder, &mut output)?;
 
             let mut drafts = mtp.draft(n_past, token, &tokens_list)
@@ -431,6 +474,9 @@ impl LLM {
 
             for draft_token in drafts.iter().copied().take(accepted) {
                 append_token(&self.model, draft_token, &mut decoder, &mut output)?;
+                // An accepted draft counts, unless it is the end-of-generation
+                // token, which is never counted (RD-18).
+                usage.record_output(self.model.is_eog_token(draft_token));
             }
             accepted_total += accepted;
             token = next;
@@ -440,7 +486,7 @@ impl LLM {
         eprintln!(
             "ltengine: MTP proposed {proposed} tokens, accepted {accepted_total}"
         );
-        clean_output(output)
+        clean_output(output).map(|text| (text, usage.output_tokens))
     }
 }
 
@@ -639,7 +685,9 @@ fn validate_mtp_n_max(value: i32) -> Result<()> {
 }
 
 impl LLMContext<'_>{
-    pub fn process(&mut self, tokens_list: Vec<LlamaToken>) -> Result<String>{
+    /// Decode a prompt and return the cleaned text with the number of generated
+    /// token IDs, excluding the end-of-generation token (RD-18).
+    pub fn process(&mut self, tokens_list: Vec<LlamaToken>) -> Result<(String, u32)>{
         // let ctx_size: i32 = tokens_list.len() as i32 * 3;
         
         // We use this object to submit token data for decoding
@@ -661,6 +709,7 @@ impl LLMContext<'_>{
         let mut sampler = create_sampler(&self.llm.model);
 
         let mut output = String::new();
+        let mut usage = TokenUsage::default();
 
         while n_cur <= self.ctx_size {
 
@@ -674,7 +723,9 @@ impl LLMContext<'_>{
                 if self.llm.model.is_eog_token(token) {
                     break;
                 }
-                    
+
+                // RD-18: count the generated token, end-of-generation excluded.
+                usage.record_output(false);
                 append_token(&self.llm.model, token, &mut decoder, &mut output)?;
 
                 batch.clear();
@@ -686,7 +737,7 @@ impl LLMContext<'_>{
             self.ctx.decode(&mut batch).with_context(|| "Failed to eval")?;
         }
 
-        clean_output(output)
+        clean_output(output).map(|text| (text, usage.output_tokens))
     }
 }
 
@@ -694,7 +745,7 @@ impl LLMContext<'_>{
 mod tests {
     use super::{
         clean_output, mtp_mode, parse_nextn_layers, reasoning_kwargs, validate_mtp_n_max, MtpMode,
-        Reasoning,
+        Reasoning, TokenUsage,
     };
 
     #[test]
@@ -713,6 +764,16 @@ mod tests {
         assert_eq!(parse_nextn_layers(Some("junk")), 0);
         assert_eq!(parse_nextn_layers(Some("")), 0);
         assert_eq!(parse_nextn_layers(None), 0);
+    }
+
+    #[test]
+    fn usage_total_is_the_exact_sum_and_eog_is_not_counted() {
+        let mut usage = TokenUsage { input_tokens: 5, output_tokens: 0 };
+        assert_eq!(usage.total_tokens(), 5);
+        usage.record_output(false);
+        usage.record_output(true);
+        assert_eq!(usage.output_tokens, 1);
+        assert_eq!(usage.total_tokens(), 6);
     }
 
     #[test]
