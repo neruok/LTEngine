@@ -2,6 +2,7 @@ use llama_cpp_2::context::params::{LlamaContextParams, LlamaContextType};
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel, LlamaChatMessage};
+use llama_cpp_2::chat::LlamaMinjaChatTemplate;
 use llama_cpp_2::token::LlamaToken;
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_batch::LlamaBatch;
@@ -213,22 +214,19 @@ impl LLM {
                 .context("Failed to build chat message")?
         ];
 
-        // Use the model's embedded chat template when llama.cpp can detect it.
-        // Falls back to hardcoded Gemma format when detection fails (e.g. Gemma 4
-        // until llama-cpp-sys picks up the upstream Gemma 4 template detection fix).
-        let llm_input = match self.model
-            .chat_template(None)
-            .ok()
-            .and_then(|tmpl| self.model.apply_chat_template(&tmpl, &messages, true).ok())
-        {
-            Some(s) => s,
-            None => {
-                eprintln!("ltengine: apply_chat_template failed: using hardcoded Gemma format");
-                format!("<start_of_turn>user\n{system}\n\n{user}<end_of_turn>\n<start_of_turn>model\n")
-            }
-        };
+        // Render with the model's embedded Jinja template through llama.cpp's
+        // Minja engine. Unlike apply_chat_template, Minja handles templates that
+        // the built-in name list cannot (e.g. Gemma 4).
+        let template = LlamaMinjaChatTemplate::from_model(&self.model)
+            .with_context(|| "Model has no usable embedded chat template")?;
+        let llm_input = template
+            .render(&messages, true, false)
+            .with_context(|| "Failed to apply the model's chat template")?;
 
-        // BOS is not added by apply_chat_template — str_to_token handles it.
+        // llama.cpp strips a leading BOS from the rendered text whenever the
+        // vocabulary enables add_bos (common/chat.cpp), so the rendered prompt
+        // cannot be assumed to carry one. AddBos::Always maps to
+        // add_special=true and lets the vocabulary decide.
         let tokens_list = self.model
             .str_to_token(&llm_input, AddBos::Always)
             .with_context(|| "Failed to tokenize prompt")?;
