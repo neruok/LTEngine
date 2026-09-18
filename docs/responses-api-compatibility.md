@@ -505,3 +505,45 @@ Limits of this record:
 2. Retention limits and storage limits stay `RD-9` and `RD-25` (`PH-6`).
 3. Replay accepts `stream` and `starting_after` only. `include` and
    `include_obfuscation` return HTTP 400 that names the field.
+
+## 13. `PH-6a`: conversations and conversation items
+
+`PH-6a` delivers `SP-PLANNED-010` under `RD-23`. It adds the OpenAI
+Conversations routes and the `conversation` request field.
+
+| Behavior | Contract |
+| -------- | -------- |
+| `POST /v1/conversations` | HTTP 200 with a `conv_*` object: `object` `conversation`, `created_at`, and `metadata` (`null` when absent). |
+| `GET /v1/conversations/{id}` | HTTP 200 with the object; an unknown id returns the conversation 404 body. |
+| `POST /v1/conversations/{id}` | HTTP 200 with the updated object; `metadata` is replaced. |
+| `DELETE /v1/conversations/{id}` | HTTP 200 with `{"id","object":"conversation.deleted","deleted":true}`. |
+| `POST .../items` | HTTP 200 with the created items; an item without an `id` receives `msg_`, `fc_`, or `fco_` by shape. |
+| `GET .../items` | HTTP 200 with `{"object":"list","data":[...],"first_id":...,"last_id":...,"has_more":false}` in insertion order. |
+| `GET .../items/{item_id}` | HTTP 200 with the item; an unknown item returns the item 404 body. |
+| `DELETE .../items/{item_id}` | HTTP 200 with `{"id","object":"conversation.item.deleted","deleted":true}`. |
+| `conversation` on `POST /v1/responses` | Prepends the conversation items, echoes `conversation` `{"id":...}`, and appends the request input items and the output items. `conversation` with `previous_response_id` is a 400. |
+| Item limit | `--max-conversation-items` default `100`, `0` disables. An add beyond the limit is HTTP 400 naming the limit. The response path checks the bound before generation. |
+| Retention | `--retention-secs` default `86400`, `0` disables. An expired conversation returns the conversation 404 body and is removed lazily. |
+| Credential and query guard | Every route enforces the `RD-4` bearer token and returns HTTP 400 that names an unsupported query field. |
+
+Live evidence, local fixture `http://127.0.0.1:5051`, key `ph1-test-key`:
+
+| Check | Result |
+| ----- | ------ |
+| Create, retrieve, update, delete | `PASS` |
+| Add items, list order, get item, delete item | `PASS` |
+| Response with `conversation` | `PASS`: `conversation` echo and the appended input and output items |
+| `conversation` with `previous_response_id` | `PASS`: HTTP 400 naming `conversation` |
+| Unknown conversation and item | `PASS`: the declared 404 bodies |
+| Missing bearer and query field | `PASS`: HTTP 401 and HTTP 400 naming the field |
+| Unit tests | `PASS`: `CARGO_NET_OFFLINE=true cargo test` exits 0 with 89 passed and 0 failed |
+| Release build | `PASS`: `CARGO_NET_OFFLINE=true cargo build --release` exits 0 |
+| Preserved behavior | `PASS`: `bin/lt ph1` reports 60 ok of 60 |
+
+Limits of this record:
+
+1. The item list has no pagination and no ordering parameter.
+2. `POST .../items` stores items as sent. A stored item with an unsupported
+   content part is skipped when the prompt is built.
+3. The item limit and the retention boundary are unit checks. The live run uses
+   the default flags.

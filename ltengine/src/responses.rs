@@ -27,12 +27,14 @@ use crate::llm;
 use crate::responses_http::{bearer, check_auth, error_json, extractor_error, not_found};
 use crate::responses_input::{
     ResponseInput, input_items, map_input, output_items_as_input, parse_input_items,
+    stored_items_as_input,
 };
 use crate::responses_schema::{derive_format, ResponseTextConfig, StructuredFormat};
 use crate::responses_shape::{
-    StreamOutput, build_response, build_stream_body, calls_output, message_output,
+    StreamOutput, build_response_with_conversation, build_stream_body_with_conversation,
+    calls_output, message_output,
 };
-use crate::responses_store::{AppStore, ResponseStore, StoredResponse};
+use crate::responses_store::{AppStore, ConversationRecord, ResponseStore, StoredResponse};
 use crate::responses_tools::{ModelTurn, ToolEcho, ToolRequest, parse_tools, parse_turn};
 
 /// Request body of `POST /v1/responses`.
@@ -91,6 +93,12 @@ pub struct CreateRequest {
     /// input items and output items are prepended to this request's input.
     #[serde(default)]
     pub previous_response_id: Option<String>,
+    /// OpenAI `conversation` (PH-6a, RD-23). A `conv_*` identifier. The
+    /// conversation's items are prepended to this request's input, and the
+    /// request's input items and the response's output items are appended to
+    /// the conversation. It cannot be combined with `previous_response_id`.
+    #[serde(default)]
+    pub conversation: Option<String>,
 }
 
 
@@ -131,6 +139,12 @@ fn validate(request: &CreateRequest, loaded_model: &str) -> Result<PreparedPromp
                 ),
             ));
         }
+    }
+    if request.conversation.is_some() && request.previous_response_id.is_some() {
+        return Err((
+            400,
+            "`conversation` cannot be combined with `previous_response_id`".to_string(),
+        ));
     }
     let tools = parse_tools(
         request.tools.as_ref(),
@@ -183,18 +197,34 @@ struct EffectivePrompt {
 
 /// Build the prompt and the effective input items.
 ///
-/// Without `previous_response_id` the prepared prompt is reused unchanged, so
-/// the behavior of `PH-1` through `PH-4b` is preserved (`PH5-13`).
+/// Without `conversation` or `previous_response_id` the prepared prompt is
+/// reused unchanged, so the behavior of `PH-1` through `PH-4b` is preserved
+/// (`PH5-13`, `PH6A-14`).
 ///
-/// With it, the effective input is the referenced record's input items, then its
-/// output items as input items, then this request's input items. The referenced
-/// `instructions` are not carried, because they are not an item.
+/// With `conversation`, the conversation items are prepended to this request's
+/// input items (`RD-23`). With `previous_response_id`, the referenced record's
+/// input items and output items are prepended (`RD-22`). Neither carries the
+/// referenced `instructions`, because those are not an item.
 fn effective_prompt(
     request: &CreateRequest,
     prepared: &PreparedPrompt,
     previous: Option<&StoredResponse>,
+    conversation: Option<&ConversationRecord>,
 ) -> Result<EffectivePrompt, String> {
     let current = input_items(&request.input);
+    if let Some(conversation) = conversation {
+        let mut items = stored_items_as_input(&conversation.items);
+        items.extend(current.clone());
+        let input = parse_input_items(items)?;
+        let (mut system, user) = map_input(request.instructions.as_deref(), &input)?;
+        append_tools_note(&mut system, prepared);
+        // Only the request's own items are stored on the response record.
+        return Ok(EffectivePrompt {
+            system,
+            user,
+            input_items: current,
+        });
+    }
     let Some(previous) = previous else {
         return Ok(EffectivePrompt {
             system: prepared.system.clone(),
@@ -207,17 +237,31 @@ fn effective_prompt(
     items.extend(current);
     let input = parse_input_items(items.clone())?;
     let (mut system, user) = map_input(request.instructions.as_deref(), &input)?;
+    append_tools_note(&mut system, prepared);
+    Ok(EffectivePrompt {
+        system,
+        user,
+        input_items: items,
+    })
+}
+
+/// Append the tool transcription note to the system text (`RD-20`).
+fn append_tools_note(system: &mut String, prepared: &PreparedPrompt) {
     if let Some(note) = prepared.tools.system_note() {
         if !system.is_empty() {
             system.push('\n');
         }
         system.push_str(&note);
     }
-    Ok(EffectivePrompt {
-        system,
-        user,
-        input_items: items,
-    })
+}
+
+/// The largest number of output items one generation can produce (`RD-23`).
+fn max_output_items(tools: &ToolRequest) -> usize {
+    if tools.offers_tools() && tools.parallel_tool_calls {
+        tools.tools.len().max(1)
+    } else {
+        1
+    }
 }
 
 /// Resolve `previous_response_id` before generation (PH-5, RD-22). An unknown
@@ -255,16 +299,16 @@ fn persist(
 fn maybe_store(
     store: &dyn ResponseStore,
     enabled: bool,
-    completed: serde_json::Value,
-    input_items: Vec<serde_json::Value>,
+    completed: &serde_json::Value,
+    input_items: &[serde_json::Value],
 ) -> Result<(), (u16, String)> {
     if !enabled {
         return Ok(());
     }
     let id = completed["id"].as_str().unwrap_or_default().to_string();
     let record = StoredResponse {
-        response: completed,
-        input_items,
+        response: completed.clone(),
+        input_items: input_items.to_vec(),
     };
     persist(store, &id, &record)
 }
@@ -316,22 +360,50 @@ pub async fn create_response(
         Err((status, message)) => return error_json(status, message),
     };
 
-    // Resolve `previous_response_id` before generation, so an unknown identifier
-    // is a 404 that never reaches the model (RD-22).
+    // Resolve `previous_response_id` or `conversation` before generation, so an
+    // unknown identifier is a 404 that never reaches the model (RD-22, RD-23).
     let previous = match resolve_previous(store.get_ref().as_ref(), request.previous_response_id.as_deref()) {
         Ok(previous) => previous,
         Err(response) => return response,
+    };
+    let conversation_id = request.conversation.clone();
+    let conversation = match conversation_id.as_deref() {
+        None => None,
+        Some(id) => match crate::responses_conversations::load_conversation(
+            store.get_ref().as_ref(),
+            id,
+            args.retention_secs,
+        ) {
+            Ok(Some(record)) => Some(record),
+            Ok(None) => return crate::responses_conversations::conversation_not_found(id),
+            Err(err) => {
+                return error_json(500, format!("failed to read the conversation store: {err}"));
+            }
+        },
     };
     let EffectivePrompt {
         system,
         user,
         input_items,
-    } = match effective_prompt(&request, &prepared, previous.as_ref()) {
+    } = match effective_prompt(&request, &prepared, previous.as_ref(), conversation.as_ref()) {
         Ok(prompt) => prompt,
         Err(message) => return error_json(400, message),
     };
     let format = &prepared.format;
     let tools = &prepared.tools;
+
+    // The conversation item limit is checked before generation, so the append
+    // can never overflow it (RD-23).
+    if let Some(record) = &conversation {
+        let limit = args.max_conversation_items;
+        let needed = record.items.len() + input_items.len() + max_output_items(tools);
+        if limit != 0 && needed > limit {
+            return error_json(
+                400,
+                format!("the conversation item limit of {limit} would be exceeded"),
+            );
+        }
+    }
 
     let streaming = request.stream == Some(true);
     let grammar = if tools.offers_tools() {
@@ -344,28 +416,37 @@ pub async fn create_response(
     match llm.run_prompt_usage_grammar(system, user, grammar, &crate::llm::Reasoning::default()) {
         Ok((text, usage)) => {
             let echo = ToolEcho::from_request(tools);
+            let conversation_ref = conversation_id.as_deref();
             let (response, completed) = if tools.offers_tools() {
                 // The model answers with the transcription envelope (RD-20).
                 match parse_turn(&text, tools) {
-                    Ok(ModelTurn::Message(answer)) => {
-                        build_text_like(&loaded_model, &answer, &echo, &request, &usage, streaming)
-                    }
+                    Ok(ModelTurn::Message(answer)) => build_text_like(
+                        &loaded_model,
+                        &answer,
+                        &echo,
+                        &request,
+                        conversation_ref,
+                        &usage,
+                        streaming,
+                    ),
                     Ok(ModelTurn::Calls(calls)) => {
                         if streaming {
-                            let (body, completed) = build_stream_body(
+                            let (body, completed) = build_stream_body_with_conversation(
                                 &loaded_model,
                                 StreamOutput::Calls(&calls),
                                 &echo,
                                 request.metadata.as_ref(),
+                                conversation_ref,
                                 &usage,
                             );
                             (sse_response(body), completed)
                         } else {
-                            let body = build_response(
+                            let body = build_response_with_conversation(
                                 &loaded_model,
                                 calls_output(&calls),
                                 &echo,
                                 request.metadata.as_ref(),
+                                conversation_ref,
                                 &usage,
                             );
                             (HttpResponse::Ok().json(body.clone()), body)
@@ -379,13 +460,35 @@ pub async fn create_response(
                         return error_json(500, message);
                     }
                 }
-                build_text_like(&loaded_model, &text, &echo, &request, &usage, streaming)
+                build_text_like(
+                    &loaded_model,
+                    &text,
+                    &echo,
+                    &request,
+                    conversation_ref,
+                    &usage,
+                    streaming,
+                )
             };
             // One fail-closed attempt to store the completed response (RD-15).
-            if let Err((status, message)) =
-                maybe_store(store.get_ref().as_ref(), store_enabled, completed, input_items)
-            {
+            if let Err((status, message)) = maybe_store(
+                store.get_ref().as_ref(),
+                store_enabled,
+                &completed,
+                &input_items,
+            ) {
                 return error_json(status, message);
+            }
+            // Append the request input items and the output items to the
+            // conversation (RD-23).
+            if let (Some(id), Some(mut record)) = (conversation_id.as_deref(), conversation) {
+                record.items.extend(input_items.iter().cloned());
+                if let Some(output) = completed["output"].as_array() {
+                    record.items.extend(output.iter().cloned());
+                }
+                if let Err(err) = store.get_ref().put_conversation(id, &record) {
+                    return error_json(500, format!("failed to store the conversation: {err}"));
+                }
             }
             response
         }
@@ -401,29 +504,33 @@ pub async fn create_response(
 }
 
 /// Build the text response, streaming or not.
+#[allow(clippy::too_many_arguments)]
 fn build_text_like(
     model: &str,
     text: &str,
     echo: &ToolEcho,
     request: &CreateRequest,
+    conversation: Option<&str>,
     usage: &llm::TokenUsage,
     streaming: bool,
 ) -> (HttpResponse, serde_json::Value) {
     if streaming {
-        let (body, completed) = build_stream_body(
+        let (body, completed) = build_stream_body_with_conversation(
             model,
             StreamOutput::Text(text),
             echo,
             request.metadata.as_ref(),
+            conversation,
             usage,
         );
         (sse_response(body), completed)
     } else {
-        let body = build_response(
+        let body = build_response_with_conversation(
             model,
             message_output(text),
             echo,
             request.metadata.as_ref(),
+            conversation,
             usage,
         );
         (HttpResponse::Ok().json(body.clone()), body)

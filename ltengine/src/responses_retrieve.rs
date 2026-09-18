@@ -11,30 +11,8 @@ use actix_web::{HttpRequest, HttpResponse, delete, get, web};
 use serde_json::Value;
 
 use crate::Args;
-use crate::responses_http::{
-    bearer, check_auth, error_json, first_query_field, not_found, query_fields,
-};
+use crate::responses_http::{auth_guard, error_json, not_found, query_fields, strict_guard};
 use crate::responses_store::AppStore;
-
-/// The credential check and the query guard shared by the retrieval routes.
-///
-/// `RD-4` fixes bearer auth. `CC-6` fixes one outcome for an unsupported query
-/// field: a clear 400 that names it. `PH-5` supports no query field, so
-/// `stream=true` and every other field take the 400 path. The credential is
-/// checked first, so a request without it is a 401 even when a query field is
-/// also present.
-fn guard(req: &HttpRequest, args: &Args) -> Option<HttpResponse> {
-    if let Err(message) = check_auth(&args.api_key, bearer(req)) {
-        return Some(error_json(401, message));
-    }
-    if let Some(field) = first_query_field(req) {
-        return Some(error_json(
-            400,
-            format!("unsupported query field `{field}` on this route"),
-        ));
-    }
-    None
-}
 
 /// The supported query of retrieval (`RD-27`).
 struct RetrieveQuery {
@@ -102,8 +80,8 @@ pub async fn get_response(
     args: web::Data<Arc<Args>>,
     store: web::Data<AppStore>,
 ) -> HttpResponse {
-    if let Err(message) = check_auth(&args.api_key, bearer(&req)) {
-        return error_json(401, message);
+    if let Some(response) = auth_guard(&req, &args) {
+        return response;
     }
     let query = match parse_retrieve_query(&req) {
         Ok(query) => query,
@@ -142,7 +120,7 @@ pub async fn delete_response(
     args: web::Data<Arc<Args>>,
     store: web::Data<AppStore>,
 ) -> HttpResponse {
-    if let Some(response) = guard(&req, &args) {
+    if let Some(response) = strict_guard(&req, &args) {
         return response;
     }
     let id = path.into_inner();
@@ -165,7 +143,7 @@ pub async fn list_input_items(
     args: web::Data<Arc<Args>>,
     store: web::Data<AppStore>,
 ) -> HttpResponse {
-    if let Some(response) = guard(&req, &args) {
+    if let Some(response) = strict_guard(&req, &args) {
         return response;
     }
     let id = path.into_inner();

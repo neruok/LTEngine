@@ -157,6 +157,62 @@ pub fn parse_input_items(items: Vec<serde_json::Value>) -> Result<ResponseInput,
         .map_err(|err| format!("invalid input item: {err}"))
 }
 
+/// Convert stored conversation items to input items for the prompt (`PH-6a`).
+///
+/// A message item keeps its `role` and `content`, with each content part
+/// normalized to `{type, text}`. That drops a stored `id`, `status`, or
+/// `annotations` field before the strict `InputItem` parsing, and it skips an
+/// item that carries an unsupported part. A `function_call` or
+/// `function_call_output` item keeps its tool fields.
+pub fn stored_items_as_input(items: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    items.iter().filter_map(stored_item_as_input).collect()
+}
+
+fn stored_item_as_input(item: &serde_json::Value) -> Option<serde_json::Value> {
+    if let Some(role) = item.get("role").and_then(serde_json::Value::as_str) {
+        let content = match item.get("content")? {
+            serde_json::Value::String(text) => serde_json::Value::String(text.clone()),
+            serde_json::Value::Array(parts) => {
+                let mut normalized = Vec::with_capacity(parts.len());
+                for part in parts {
+                    normalized.push(normalized_part(part)?);
+                }
+                serde_json::Value::Array(normalized)
+            }
+            _ => return None,
+        };
+        return Some(serde_json::json!({"role": role, "content": content}));
+    }
+    match item.get("type").and_then(serde_json::Value::as_str) {
+        Some("function_call") => Some(serde_json::json!({
+            "type": "function_call",
+            "call_id": item.get("call_id")?,
+            "name": item.get("name")?,
+            "arguments": item
+                .get("arguments")
+                .cloned()
+                .unwrap_or(serde_json::Value::String("{}".to_string())),
+        })),
+        Some("function_call_output") => Some(serde_json::json!({
+            "type": "function_call_output",
+            "call_id": item.get("call_id")?,
+            "output": item.get("output").cloned().unwrap_or(serde_json::Value::Null),
+        })),
+        _ => None,
+    }
+}
+
+fn normalized_part(part: &serde_json::Value) -> Option<serde_json::Value> {
+    let kind = part.get("type").and_then(serde_json::Value::as_str)?;
+    if kind != "input_text" && kind != "output_text" {
+        return None;
+    }
+    Some(serde_json::json!({
+        "type": kind,
+        "text": part.get("text").and_then(serde_json::Value::as_str).unwrap_or_default(),
+    }))
+}
+
 /// Map `instructions` and `input` onto the `run_prompt(system, user)` pair.
 ///
 /// `ponytail:` message roles collapse into two text blocks, so a multi-turn

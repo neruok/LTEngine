@@ -106,18 +106,21 @@ fn usage_json(usage: &llm::TokenUsage) -> Value {
 }
 
 /// The OpenAI-shaped response object, shared by the non-streaming body and the
-/// `response.completed` and `response.in_progress` events.
+/// `response.completed` and `response.in_progress` events. The `conversation`
+/// key is added only when the request named a conversation, so a request that
+/// carries none keeps the pre-`PH-6a` shape (`PH6A-14`).
 fn response_object(
     id: &str,
     created_at: u64,
     status: &str,
     model: &str,
     metadata: Option<&Value>,
+    conversation: Option<&str>,
     echo: &ToolEcho,
     output: Value,
     usage: Value,
 ) -> Value {
-    json!({
+    let mut object = json!({
         "id": id,
         "object": "response",
         "created_at": created_at,
@@ -129,19 +132,26 @@ fn response_object(
         "tools": echo.tools,
         "output": output,
         "usage": usage,
-    })
+    });
+    if let Some(id) = conversation {
+        object["conversation"] = json!({"id": id});
+    }
+    object
 }
 
-/// OpenAI-shaped non-streaming response. `output` is the item array that the
-/// handler built. `usage` carries the exact counts of the one generation
-/// (PH-3, RD-18). `echo` carries the truthful tool values of the request
-/// (`PH-4b`, RD-20). `metadata` echoes the accepted request value, or `null`
-/// when the request carried none.
-pub(crate) fn build_response(
+/// OpenAI-shaped non-streaming response (`PH-1`, `PH-3`, `PH-4b`).
+///
+/// `output` is the item array that the handler built. `usage` carries the exact
+/// counts of the one generation (`RD-18`). `echo` carries the truthful tool
+/// values of the request (`RD-20`). `metadata` echoes the accepted request
+/// value, or `null` when the request carried none. `conversation` adds the
+/// `PH-6a` echo only when the request named a conversation (`PH6A-14`).
+pub(crate) fn build_response_with_conversation(
     model: &str,
     output: Value,
     echo: &ToolEcho,
     metadata: Option<&Value>,
+    conversation: Option<&str>,
     usage: &llm::TokenUsage,
 ) -> Value {
     response_object(
@@ -150,6 +160,7 @@ pub(crate) fn build_response(
         "completed",
         model,
         metadata,
+        conversation,
         echo,
         output,
         usage_json(usage),
@@ -386,11 +397,12 @@ fn render_events(events: &[(String, Value)], starting_after: Option<u32>) -> Str
 /// message carries one delta with the whole text. RD-17 permits zero or more
 /// delta events, and `clean_output` can retract text at the end, so the whole
 /// text is the only safe delta.
-pub(crate) fn build_stream_body(
+pub(crate) fn build_stream_body_with_conversation(
     model: &str,
     output: StreamOutput<'_>,
     echo: &ToolEcho,
     metadata: Option<&Value>,
+    conversation: Option<&str>,
     usage: &llm::TokenUsage,
 ) -> (String, Value) {
     let response_id = new_id("resp_");
@@ -402,6 +414,7 @@ pub(crate) fn build_stream_body(
         "in_progress",
         model,
         metadata,
+        conversation,
         echo,
         json!([]),
         Value::Null,
@@ -412,6 +425,7 @@ pub(crate) fn build_stream_body(
         "completed",
         model,
         metadata,
+        conversation,
         echo,
         Value::Array(items.clone()),
         usage_json(usage),

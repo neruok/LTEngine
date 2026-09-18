@@ -24,13 +24,38 @@ pub(crate) struct StoredResponse {
     pub input_items: Vec<Value>,
 }
 
+/// The stored record of one conversation (`PH-6a`, `RD-23`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ConversationRecord {
+    pub id: String,
+    pub created_at: u64,
+    pub metadata: Value,
+    pub items: Vec<Value>,
+}
+
+impl ConversationRecord {
+    /// The OpenAI-shaped conversation object. The items are not part of it.
+    pub(crate) fn response(&self) -> Value {
+        serde_json::json!({
+            "id": self.id,
+            "object": "conversation",
+            "created_at": self.created_at,
+            "metadata": self.metadata,
+        })
+    }
+}
+
 /// The storage boundary of `RD-21`. One narrow interface with one file-backed
-/// implementation. Every method reports an `io::Error` so the route can answer
-/// fail-closed with the OpenAI-shaped HTTP 500 body (`RD-15`).
+/// implementation. It holds responses (`PH-5`) and conversations (`PH-6a`).
+/// Every method reports an `io::Error` so a route can answer fail-closed with
+/// the OpenAI-shaped HTTP 500 body (`RD-15`).
 pub(crate) trait ResponseStore: Send + Sync {
     fn put(&self, id: &str, record: &StoredResponse) -> io::Result<()>;
     fn get(&self, id: &str) -> io::Result<Option<StoredResponse>>;
     fn delete(&self, id: &str) -> io::Result<bool>;
+    fn put_conversation(&self, id: &str, record: &ConversationRecord) -> io::Result<()>;
+    fn get_conversation(&self, id: &str) -> io::Result<Option<ConversationRecord>>;
+    fn delete_conversation(&self, id: &str) -> io::Result<bool>;
 }
 
 /// Shared handle that the Actix app data carries.
@@ -41,7 +66,16 @@ pub(crate) type AppStore = Arc<dyn ResponseStore>;
 /// Every identifier passes this check before a path is built, so a path
 /// parameter can never escape the store directory (`PH5-10`).
 pub(crate) fn valid_id(id: &str) -> bool {
-    id.strip_prefix("resp_").is_some_and(|rest| {
+    is_hex_id(id, "resp_")
+}
+
+/// True only for `conv_` followed by one or more lowercase hexadecimal digits.
+pub(crate) fn valid_conversation_id(id: &str) -> bool {
+    is_hex_id(id, "conv_")
+}
+
+fn is_hex_id(id: &str, prefix: &str) -> bool {
+    id.strip_prefix(prefix).is_some_and(|rest| {
         !rest.is_empty()
             && rest
                 .bytes()
@@ -68,6 +102,15 @@ impl FileStore {
     }
 
     fn temp_path(&self, id: &str) -> PathBuf {
+        self.dir.join(format!("{id}.json.tmp"))
+    }
+
+    /// The path of one conversation record.
+    pub(crate) fn conversation_path(&self, id: &str) -> PathBuf {
+        self.dir.join(format!("{id}.json"))
+    }
+
+    fn conversation_temp_path(&self, id: &str) -> PathBuf {
         self.dir.join(format!("{id}.json.tmp"))
     }
 }
@@ -107,6 +150,41 @@ impl ResponseStore for FileStore {
             Err(err) => Err(err),
         }
     }
+
+    fn put_conversation(&self, id: &str, record: &ConversationRecord) -> io::Result<()> {
+        if !valid_conversation_id(id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid conversation id: {id}"),
+            ));
+        }
+        let bytes = serde_json::to_vec(record).map_err(io::Error::other)?;
+        fs::write(self.conversation_temp_path(id), &bytes)?;
+        fs::rename(self.conversation_temp_path(id), self.conversation_path(id))?;
+        Ok(())
+    }
+
+    fn get_conversation(&self, id: &str) -> io::Result<Option<ConversationRecord>> {
+        if !valid_conversation_id(id) {
+            return Ok(None);
+        }
+        match fs::read(self.conversation_path(id)) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(io::Error::other),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn delete_conversation(&self, id: &str) -> io::Result<bool> {
+        if !valid_conversation_id(id) {
+            return Ok(false);
+        }
+        match fs::remove_file(self.conversation_path(id)) {
+            Ok(()) => Ok(true),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
 }
 
 /// A store that always fails, for the `PH5-09` fail-closed check.
@@ -124,6 +202,18 @@ impl ResponseStore for FailingStore {
     }
 
     fn delete(&self, _id: &str) -> io::Result<bool> {
+        Err(io::Error::other("store unavailable"))
+    }
+
+    fn put_conversation(&self, _id: &str, _record: &ConversationRecord) -> io::Result<()> {
+        Err(io::Error::other("store unavailable"))
+    }
+
+    fn get_conversation(&self, _id: &str) -> io::Result<Option<ConversationRecord>> {
+        Err(io::Error::other("store unavailable"))
+    }
+
+    fn delete_conversation(&self, _id: &str) -> io::Result<bool> {
         Err(io::Error::other("store unavailable"))
     }
 }
@@ -223,5 +313,43 @@ pub(crate) mod tests {
     fn valid_id_accepts_the_generated_form() {
         assert!(valid_id(&new_id("resp_")));
         assert!(valid_id("resp_0123456789abcdef"));
+    }
+
+    fn conversation() -> ConversationRecord {
+        ConversationRecord {
+            id: "conv_1".to_string(),
+            created_at: 1,
+            metadata: serde_json::json!(null),
+            items: vec![serde_json::json!({"id": "msg_1", "role": "user", "content": "hi"})],
+        }
+    }
+
+    #[test]
+    fn conversation_round_trip_and_delete() {
+        // PH6A-01 through PH6A-04 (store part).
+        let temp = TempStoreDir::new();
+        let store = FileStore::new(temp.path.clone()).expect("store dir");
+        store.put_conversation("conv_1", &conversation()).expect("put");
+        assert_eq!(
+            store.get_conversation("conv_1").expect("get"),
+            Some(conversation())
+        );
+        assert!(store.delete_conversation("conv_1").expect("delete"));
+        assert_eq!(store.get_conversation("conv_1").expect("get"), None);
+        assert!(!store.delete_conversation("conv_1").expect("delete"));
+    }
+
+    #[test]
+    fn rejects_a_conversation_traversal_id() {
+        // PH6A-13 (store part): an invalid id never becomes a path.
+        let temp = TempStoreDir::new();
+        let store = FileStore::new(temp.path.clone()).expect("store dir");
+        for id in ["../escape", "conv_", "conv_AB", "conv_xyz", "resp_1"] {
+            assert!(!valid_conversation_id(id), "{id}");
+            assert_eq!(store.get_conversation(id).expect("get"), None, "{id}");
+            assert!(!store.delete_conversation(id).expect("delete"), "{id}");
+            assert!(store.put_conversation(id, &conversation()).is_err(), "{id}");
+        }
+        assert!(!temp.path.join("..").join("escape.json").exists());
     }
 }

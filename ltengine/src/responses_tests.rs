@@ -4,11 +4,33 @@
 use super::*;
 use crate::llm::TokenUsage;
 use crate::responses_shape::{
-    StreamOutput, build_response, build_stream_body, calls_output, message_output,
-    replay_stream_body,
+    StreamOutput, build_response_with_conversation, build_stream_body_with_conversation,
+    calls_output, message_output, replay_stream_body,
 };
+
+/// The pre-`PH-6a` body shape: no conversation echo.
+fn build_response(
+    model: &str,
+    output: serde_json::Value,
+    echo: &ToolEcho,
+    metadata: Option<&serde_json::Value>,
+    usage: &TokenUsage,
+) -> serde_json::Value {
+    build_response_with_conversation(model, output, echo, metadata, None, usage)
+}
+
+/// The pre-`PH-6a` stream shape: no conversation echo.
+fn build_stream_body(
+    model: &str,
+    output: StreamOutput<'_>,
+    echo: &ToolEcho,
+    metadata: Option<&serde_json::Value>,
+    usage: &TokenUsage,
+) -> (String, serde_json::Value) {
+    build_stream_body_with_conversation(model, output, echo, metadata, None, usage)
+}
 use crate::responses_store::{
-    FailingStore, FileStore, ResponseStore, StoredResponse, tests::TempStoreDir,
+    ConversationRecord, FailingStore, FileStore, ResponseStore, StoredResponse, tests::TempStoreDir,
 };
 use crate::responses_tools::{ModelCall, ModelTurn, ToolEcho, parse_turn};
 use crate::responses_metadata::{METADATA_MAX_ENTRIES, METADATA_MAX_KEY_CHARS, METADATA_MAX_VALUE_CHARS};
@@ -658,7 +680,7 @@ fn previous_response_id_prepends_context() {
         r#"{"input":"second","instructions":"new system","previous_response_id":"resp_prev"}"#,
     );
     let prepared = validate(&request, "gemma3-4b").expect("valid");
-    let prompt = effective_prompt(&request, &prepared, Some(&previous)).expect("prompt");
+    let prompt = effective_prompt(&request, &prepared, Some(&previous), None).expect("prompt");
     // The referenced `instructions` are not carried; the request's are.
     assert_eq!(prompt.system, "new system");
     assert_eq!(prompt.user, "first\nhello\nsecond");
@@ -680,7 +702,7 @@ fn previous_response_id_is_transitive() {
     };
     let request = parse(r#"{"input":"three","previous_response_id":"resp_2"}"#);
     let prepared = validate(&request, "gemma3-4b").expect("valid");
-    let prompt = effective_prompt(&request, &prepared, Some(&previous)).expect("prompt");
+    let prompt = effective_prompt(&request, &prepared, Some(&previous), None).expect("prompt");
     assert_eq!(prompt.user, "one\ntwo\nthree");
 }
 
@@ -689,7 +711,7 @@ fn previous_response_id_absent_reuses_the_plain_prompt() {
     // PH5-13: the no-previous path preserves the PH-1 through PH-4b behavior.
     let request = parse(r#"{"input":"hi","instructions":"be terse"}"#);
     let prepared = validate(&request, "gemma3-4b").expect("valid");
-    let prompt = effective_prompt(&request, &prepared, None).expect("prompt");
+    let prompt = effective_prompt(&request, &prepared, None, None).expect("prompt");
     assert_eq!(prompt.system, prepared.system);
     assert_eq!(prompt.user, prepared.user);
     assert_eq!(prompt.input_items.len(), 1);
@@ -732,11 +754,11 @@ fn store_flag_controls_persistence() {
     // PH5-01 and PH5-02 (store part).
     let temp = TempStoreDir::new();
     let store = FileStore::new(temp.path.clone()).expect("store dir");
-    maybe_store(&store, true, serde_json::json!({"id": "resp_aaaa"}), Vec::new())
+    maybe_store(&store, true, &serde_json::json!({"id": "resp_aaaa"}), &[])
         .expect("store");
     assert!(store.get("resp_aaaa").expect("get").is_some());
 
-    maybe_store(&store, false, serde_json::json!({"id": "resp_bbbb"}), Vec::new())
+    maybe_store(&store, false, &serde_json::json!({"id": "resp_bbbb"}), &[])
         .expect("skip");
     assert!(store.get("resp_bbbb").expect("get").is_none());
 }
@@ -823,4 +845,58 @@ fn replay_is_deterministic() {
     let second = replay_stream_body(&completed, None).expect("replay");
     assert_eq!(first, second);
     assert_eq!(completed, before);
+}
+
+#[test]
+fn conversation_prepends_and_appends() {
+    // PH6A-09 (prompt part).
+    let conversation = ConversationRecord {
+        id: "conv_1".to_string(),
+        created_at: 1,
+        metadata: serde_json::Value::Null,
+        items: vec![
+            serde_json::json!({"id": "msg_1", "role": "user", "content": "first"}),
+            serde_json::json!({
+                "id": "msg_2",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "hello", "annotations": []}],
+            }),
+        ],
+    };
+    let request = parse(r#"{"input":"second","instructions":"sys","conversation":"conv_1"}"#);
+    let prepared = validate(&request, "gemma3-4b").expect("valid");
+    let prompt = effective_prompt(&request, &prepared, None, Some(&conversation)).expect("prompt");
+    assert_eq!(prompt.system, "sys");
+    assert_eq!(prompt.user, "first\nhello\nsecond");
+    // Only the request's own items are stored on the response record.
+    assert_eq!(prompt.input_items.len(), 1);
+    assert_eq!(prompt.input_items[0]["content"][0]["text"], "second");
+}
+
+#[test]
+fn conversation_with_previous_response_id_is_a_400() {
+    // PH6A-10.
+    let request =
+        parse(r#"{"input":"hi","conversation":"conv_1","previous_response_id":"resp_1"}"#);
+    let (status, message) = validate(&request, "gemma3-4b").unwrap_err();
+    assert_eq!(status, 400);
+    assert!(message.contains("conversation"), "{message}");
+}
+
+#[test]
+fn conversation_limit_is_checked_before_generation() {
+    // PH6A-11: the bound uses the declared tool count.
+    let tools = validate(
+        &parse(
+            r#"{"input":"hi","tools":[{"type":"function","name":"a","parameters":{"type":"object"}},{"type":"function","name":"b","parameters":{"type":"object"}}],"tool_choice":"auto","parallel_tool_calls":true}"#,
+        ),
+        "gemma3-4b",
+    )
+    .expect("valid")
+    .tools;
+    assert_eq!(max_output_items(&tools), 2);
+    let text_only = validate(&parse(r#"{"input":"hi"}"#), "gemma3-4b")
+        .expect("valid")
+        .tools;
+    assert_eq!(max_output_items(&text_only), 1);
 }

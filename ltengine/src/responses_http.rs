@@ -8,6 +8,8 @@
 
 use actix_web::{HttpRequest, HttpResponse, http::StatusCode, http::header};
 
+use crate::Args;
+
 /// The OpenAI-shaped nested error body of `SP-MUST-007`. `server_error` applies
 /// to HTTP 5xx, `invalid_request_error` to everything else.
 pub(crate) fn error_json(status: u16, message: String) -> HttpResponse {
@@ -81,6 +83,29 @@ pub(crate) fn query_fields(req: &HttpRequest) -> Vec<(String, Option<String>)> {
 /// `query_fields`.
 pub(crate) fn first_query_field(req: &HttpRequest) -> Option<String> {
     query_fields(req).into_iter().next().map(|(name, _)| name)
+}
+
+/// The `RD-4` credential check alone.
+pub(crate) fn auth_guard(req: &HttpRequest, args: &Args) -> Option<HttpResponse> {
+    check_auth(&args.api_key, bearer(req))
+        .err()
+        .map(|message| error_json(401, message))
+}
+
+/// The `RD-4` credential check and the `CC-6` query guard for a route that
+/// supports no query field. The credential is checked first, so a request
+/// without it is a 401 even when a query field is also present.
+pub(crate) fn strict_guard(req: &HttpRequest, args: &Args) -> Option<HttpResponse> {
+    if let Some(response) = auth_guard(req, args) {
+        return Some(response);
+    }
+    if let Some(field) = first_query_field(req) {
+        return Some(error_json(
+            400,
+            format!("unsupported query field `{field}` on this route"),
+        ));
+    }
+    None
 }
 
 #[cfg(test)]

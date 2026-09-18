@@ -16,6 +16,7 @@ mod llm;
 mod banner;
 mod prompt;
 mod responses;
+mod responses_conversations;
 mod responses_http;
 mod responses_input;
 mod responses_metadata;
@@ -78,7 +79,15 @@ struct Args {
 
     /// Directory for stored Responses API responses
     #[arg(long, default_value = "./ltengine-responses")]
-    store_dir: String
+    store_dir: String,
+
+    /// Retention period in seconds for stored responses and conversations
+    #[arg(long, default_value_t = 86400)]
+    retention_secs: u64,
+
+    /// Maximum number of items in one conversation (0 disables the limit)
+    #[arg(long, default_value_t = 100)]
+    max_conversation_items: usize
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -403,6 +412,14 @@ async fn main() -> std::io::Result<()> {
             .service(responses_retrieve::get_response)
             .service(responses_retrieve::delete_response)
             .service(responses_retrieve::list_input_items)
+            .service(responses_conversations::create_conversation)
+            .service(responses_conversations::get_conversation)
+            .service(responses_conversations::update_conversation)
+            .service(responses_conversations::delete_conversation)
+            .service(responses_conversations::add_items)
+            .service(responses_conversations::list_items)
+            .service(responses_conversations::get_item)
+            .service(responses_conversations::delete_item)
             .service(ResourceFiles::new("/", generated))
     })
     .bind((host.clone(), port))?
