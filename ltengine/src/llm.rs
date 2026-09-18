@@ -12,13 +12,21 @@ use llama_cpp_2::{send_logs_to_tracing, LogOptions};
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use parking_lot::Mutex;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use anyhow::{Result, Context};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LLMError {
     #[error("Server busy, please try again later")]
     Busy,
+    #[error("Generation was cancelled")]
+    Cancelled,
+}
+
+/// True when the optional cancellation flag is set (`PH-6b`, `RD-24`).
+fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|flag| flag.load(Ordering::Relaxed))
 }
 
 /// Exact token counts of one generation (RD-18).
@@ -311,6 +319,22 @@ impl LLM {
         grammar: Option<&str>,
         reasoning: &Reasoning<'_>,
     ) -> Result<(String, TokenUsage)>{
+        self.run_prompt_usage_grammar_cancellable(system, user, grammar, None, reasoning)
+    }
+
+    /// The same decode path with a cancellation flag (`PH-6b`, `RD-24`).
+    ///
+    /// The flag is checked before the prompt lock and at each decoded token. A
+    /// set flag returns [`LLMError::Cancelled`]. `run_prompt_usage_grammar`
+    /// delegates with `None`, so the foreground path is unchanged.
+    pub fn run_prompt_usage_grammar_cancellable(
+        &self,
+        system: String,
+        user: String,
+        grammar: Option<&str>,
+        cancel: Option<&AtomicBool>,
+        reasoning: &Reasoning<'_>,
+    ) -> Result<(String, TokenUsage)>{
         let messages = [
             LlamaChatMessage::new("user".to_string(), format!("{system}\n\n{user}"))
                 .context("Failed to build chat message")?
@@ -350,15 +374,30 @@ impl LLM {
         // as garbage starts to come out when we run inference in parallel
         // this might need to be investigated and fixed. For now we lock and process requests
         // one at a time.
-        let _lock = self.prompt_lock.try_lock_for(Duration::from_secs(120))
-            .ok_or(LLMError::Busy)?;
+        let _lock = self.lock_prompt(cancel)?;
         let (text, output_tokens) = if self.mtp_model.is_some() || self.self_mtp {
-            self.process_mtp(tokens_list, ctx_size, grammar)?
+            self.process_mtp(tokens_list, ctx_size, grammar, cancel)?
         } else {
             let mut ctx = self.create_context(ctx_size)?;
-            ctx.process(tokens_list, grammar)?
+            ctx.process(tokens_list, grammar, cancel)?
         };
         Ok((text, TokenUsage { input_tokens, output_tokens }))
+    }
+
+    /// Acquire the prompt lock and observe the cancellation flag (`RD-24`).
+    fn lock_prompt(&self, cancel: Option<&AtomicBool>) -> Result<parking_lot::MutexGuard<'_, ()>> {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            if is_cancelled(cancel) {
+                return Err(LLMError::Cancelled.into());
+            }
+            if let Some(guard) = self.prompt_lock.try_lock_for(Duration::from_millis(50)) {
+                return Ok(guard);
+            }
+            if Instant::now() >= deadline {
+                return Err(LLMError::Busy.into());
+            }
+        }
     }
 
     fn process_mtp(
@@ -366,6 +405,7 @@ impl LLM {
         tokens_list: Vec<LlamaToken>,
         output_limit: i32,
         grammar: Option<&str>,
+        cancel: Option<&AtomicBool>,
     ) -> Result<(String, u32)> {
         // The draft model is the separate `--mtp-model-file` model when present,
         // and otherwise the target model's own nextn/MTP head.
@@ -421,6 +461,9 @@ impl LLM {
         let mut usage = TokenUsage::default();
 
         while n_past <= output_limit {
+            if is_cancelled(cancel) {
+                return Err(LLMError::Cancelled.into());
+            }
             if self.model.is_eog_token(token) {
                 break;
             }
@@ -703,7 +746,7 @@ impl LLMContext<'_>{
     /// Decode a prompt and return the cleaned text with the number of generated
     /// token IDs, excluding the end-of-generation token (RD-18). `grammar`
     /// constrains the decode when present (PH-4a).
-    pub fn process(&mut self, tokens_list: Vec<LlamaToken>, grammar: Option<&str>) -> Result<(String, u32)>{
+    pub fn process(&mut self, tokens_list: Vec<LlamaToken>, grammar: Option<&str>, cancel: Option<&AtomicBool>) -> Result<(String, u32)>{
         // let ctx_size: i32 = tokens_list.len() as i32 * 3;
         
         // We use this object to submit token data for decoding
@@ -728,6 +771,9 @@ impl LLMContext<'_>{
         let mut usage = TokenUsage::default();
 
         while n_cur <= self.ctx_size {
+            if is_cancelled(cancel) {
+                return Err(LLMError::Cancelled.into());
+            }
 
             // sample the next token
             {

@@ -99,6 +99,12 @@ pub struct CreateRequest {
     /// the conversation. It cannot be combined with `previous_response_id`.
     #[serde(default)]
     pub conversation: Option<String>,
+    /// OpenAI `background` (PH-6b, RD-24). `true` stores the response with
+    /// status `queued`, returns it, and runs one generation in the background.
+    /// It requires `store` to be `true` and it cannot be combined with
+    /// `stream: true`.
+    #[serde(default)]
+    pub background: Option<bool>,
 }
 
 
@@ -145,6 +151,20 @@ fn validate(request: &CreateRequest, loaded_model: &str) -> Result<PreparedPromp
             400,
             "`conversation` cannot be combined with `previous_response_id`".to_string(),
         ));
+    }
+    if request.background == Some(true) {
+        if request.store == Some(false) {
+            return Err((
+                400,
+                "`background` requires `store` to be `true`".to_string(),
+            ));
+        }
+        if request.stream == Some(true) {
+            return Err((
+                400,
+                "`background` cannot be combined with `stream: true`".to_string(),
+            ));
+        }
     }
     let tools = parse_tools(
         request.tools.as_ref(),
@@ -341,6 +361,7 @@ pub async fn create_response(
     args: web::Data<Arc<Args>>,
     llm: web::Data<Arc<llm::LLM>>,
     store: web::Data<AppStore>,
+    registry: web::Data<Arc<crate::responses_background::CancelRegistry>>,
 ) -> HttpResponse {
     let authorization = bearer(&req);
 
@@ -412,6 +433,29 @@ pub async fn create_response(
         format.grammar.as_deref()
     };
     let store_enabled = request.store.unwrap_or(true);
+
+    // A background request stores a `queued` response, returns it, and runs one
+    // generation in a blocking task (`PH-6b`, `RD-24`).
+    if request.background == Some(true) {
+        let concrete: Arc<llm::LLM> = Arc::clone(llm.get_ref());
+        let generator: Arc<dyn crate::responses_background::Generate> = concrete;
+        return crate::responses_background::start(crate::responses_background::BackgroundRequest {
+            store: Arc::clone(store.get_ref()),
+            generator,
+            registry: Arc::clone(registry.get_ref()),
+            model: loaded_model,
+            metadata: request.metadata.clone(),
+            conversation: conversation_id,
+            echo: ToolEcho::from_request(tools),
+            tools: tools.clone(),
+            grammar: grammar.map(str::to_string),
+            json_required: format.json_required,
+            system,
+            user,
+            input_items,
+            conversation_record: conversation,
+        });
+    }
 
     match llm.run_prompt_usage_grammar(system, user, grammar, &crate::llm::Reasoning::default()) {
         Ok((text, usage)) => {

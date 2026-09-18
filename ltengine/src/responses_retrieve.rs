@@ -412,6 +412,25 @@ mod tests {
         assert_eq!(resp.status(), actix_web::http::StatusCode::NOT_FOUND);
     }
 
+    #[actix_web::test]
+    async fn background_response_is_retrievable() {
+        // PH6B-10: a background response is a stored response.
+        let temp = TempStoreDir::new();
+        let store: AppStore = Arc::new(store_with(&temp.path));
+        let mut record = record();
+        record.response["status"] = serde_json::json!("queued");
+        store.put("resp_1", &record).expect("put");
+        let app = service!(store, "secret");
+        let req = test::TestRequest::get()
+            .uri("/v1/responses/resp_1")
+            .insert_header(bearer("secret"))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["status"], "queued");
+    }
+
     /// Parse an SSE body into its JSON payloads.
     fn parse_sse(body: &str) -> Vec<Value> {
         body.split("\n\n")

@@ -16,6 +16,7 @@ mod llm;
 mod banner;
 mod prompt;
 mod responses;
+mod responses_background;
 mod responses_conversations;
 mod responses_http;
 mod responses_input;
@@ -394,6 +395,8 @@ async fn main() -> std::io::Result<()> {
         }),
     );
 
+    let cancel_registry = Arc::new(responses_background::CancelRegistry::new());
+
     let server = HttpServer::new(move || {
         let generated = generate();
 
@@ -402,6 +405,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(llm.clone()))
             .app_data(web::Data::new(args.clone()))
             .app_data(web::Data::new(store.clone()))
+            .app_data(web::Data::new(cancel_registry.clone()))
             .service(get_languages)
             .service(get_frontend_settings)
             .service(translate)
@@ -409,6 +413,7 @@ async fn main() -> std::io::Result<()> {
             .service(detect)
             .service(suggest)
             .service(responses::create_response)
+            .service(responses_background::cancel_response)
             .service(responses_retrieve::get_response)
             .service(responses_retrieve::delete_response)
             .service(responses_retrieve::list_input_items)

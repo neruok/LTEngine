@@ -97,7 +97,7 @@ pub(crate) fn calls_output(calls: &[ModelCall]) -> Value {
 
 /// The exact `usage` object of RD-18. `total_tokens` is the exact sum of the two
 /// exact counts. No value is an estimate (`SP-NEVER-010`).
-fn usage_json(usage: &llm::TokenUsage) -> Value {
+pub(crate) fn usage_json(usage: &llm::TokenUsage) -> Value {
     json!({
         "input_tokens": usage.input_tokens,
         "output_tokens": usage.output_tokens,
@@ -109,7 +109,7 @@ fn usage_json(usage: &llm::TokenUsage) -> Value {
 /// `response.completed` and `response.in_progress` events. The `conversation`
 /// key is added only when the request named a conversation, so a request that
 /// carries none keeps the pre-`PH-6a` shape (`PH6A-14`).
-fn response_object(
+pub(crate) fn build_response_object(
     id: &str,
     created_at: u64,
     status: &str,
@@ -154,7 +154,7 @@ pub(crate) fn build_response_with_conversation(
     conversation: Option<&str>,
     usage: &llm::TokenUsage,
 ) -> Value {
-    response_object(
+    build_response_object(
         &new_id("resp_"),
         now_secs(),
         "completed",
@@ -408,7 +408,7 @@ pub(crate) fn build_stream_body_with_conversation(
     let response_id = new_id("resp_");
     let created_at = now_secs();
     let items = stream_items(output);
-    let in_progress = response_object(
+    let in_progress = build_response_object(
         &response_id,
         created_at,
         "in_progress",
@@ -419,7 +419,7 @@ pub(crate) fn build_stream_body_with_conversation(
         json!([]),
         Value::Null,
     );
-    let completed = response_object(
+    let completed = build_response_object(
         &response_id,
         created_at,
         "completed",

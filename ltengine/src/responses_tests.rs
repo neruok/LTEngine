@@ -900,3 +900,21 @@ fn conversation_limit_is_checked_before_generation() {
         .tools;
     assert_eq!(max_output_items(&text_only), 1);
 }
+
+#[test]
+fn background_requires_store() {
+    // PH6B-08.
+    let request = parse(r#"{"input":"hi","background":true,"store":false}"#);
+    let (status, message) = validate(&request, "gemma3-4b").unwrap_err();
+    assert_eq!(status, 400);
+    assert!(message.contains("background"), "{message}");
+}
+
+#[test]
+fn background_rejects_stream() {
+    // PH6B-09.
+    let request = parse(r#"{"input":"hi","background":true,"stream":true}"#);
+    let (status, message) = validate(&request, "gemma3-4b").unwrap_err();
+    assert_eq!(status, 400);
+    assert!(message.contains("background"), "{message}");
+}

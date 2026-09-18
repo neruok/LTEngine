@@ -547,3 +547,37 @@ Limits of this record:
    content part is skipped when the prompt is built.
 3. The item limit and the retention boundary are unit checks. The live run uses
    the default flags.
+
+## 14. `PH-6b`: background responses and cancellation
+
+`PH-6b` delivers `SP-PLANNED-011` under `RD-16` and `RD-24`.
+
+| Behavior | Contract |
+| -------- | -------- |
+| `background: true` | Stores the response with status `queued`, returns it immediately, and runs one generation in a blocking task. |
+| Status sequence | `queued`, then `in_progress`, then exactly one of `completed`, `failed`, or `cancelled`. |
+| `failed` | One generation attempt and zero retries (`RD-16`). |
+| `POST /v1/responses/{id}/cancel` | On a non-terminal response, returns HTTP 200 with status `cancelled`. On a terminal response, returns it unchanged. An unknown id returns the `RD-22` 404 body. |
+| Cancellation signal | A per-job `AtomicBool`, observed before the prompt lock and at each decoded token in `ltengine/src/llm.rs` (`RD-24`). One decode path (`CC-4`). |
+| `background: true, store: false` | HTTP 400 that names `background`. |
+| `background: true, stream: true` | HTTP 400 that names `background`. |
+
+Live evidence, local fixture `http://127.0.0.1:5051`, key `ph1-test-key`:
+
+| Check | Result |
+| ----- | ------ |
+| Background request | `PASS`: HTTP 200 with status `queued` and an empty `output` |
+| Background completion | `PASS`: status `completed` with an `output_text` item and real usage |
+| Cancel a running response | `PASS`: status `cancelled`, and the final status stays `cancelled` |
+| Cancel a terminal response | `PASS`: the response is unchanged |
+| Cancel an unknown id | `PASS`: the `RD-22` 404 body |
+| `background` with `store:false`, and with `stream:true` | `PASS`: HTTP 400 naming `background` |
+| Unit tests | `PASS`: `CARGO_NET_OFFLINE=true cargo test` exits 0 with 99 passed and 0 failed |
+| Release build | `PASS`: `CARGO_NET_OFFLINE=true cargo build --release` exits 0 |
+| Preserved behavior | `PASS`: `bin/lt ph1` reports 60 ok of 60 |
+
+Limits of this record:
+
+1. Cancellation is observed at the next decoded token, so a running response can
+   emit a few more tokens before it stops.
+2. A background job does not survive a process exit (`RD-22`).
