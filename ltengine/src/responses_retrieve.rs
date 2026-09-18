@@ -88,7 +88,7 @@ pub async fn get_response(
         Err(response) => return response,
     };
     let id = path.into_inner();
-    match store.get_ref().get(&id) {
+    match crate::responses_limits::load_response(store.get_ref().as_ref(), &id, args.retention_secs) {
         Ok(Some(record)) => {
             if query.stream {
                 match crate::responses_shape::replay_stream_body(
@@ -124,14 +124,20 @@ pub async fn delete_response(
         return response;
     }
     let id = path.into_inner();
-    match store.get_ref().delete(&id) {
-        Ok(true) => HttpResponse::Ok().json(serde_json::json!({
-            "id": id,
-            "object": "response",
-            "deleted": true,
-        })),
-        Ok(false) => not_found(&id),
-        Err(err) => error_json(500, format!("failed to delete from the response store: {err}")),
+    match crate::responses_limits::load_response(store.get_ref().as_ref(), &id, args.retention_secs) {
+        Ok(Some(_)) => match store.get_ref().delete(&id) {
+            Ok(true) => HttpResponse::Ok().json(serde_json::json!({
+                "id": id,
+                "object": "response",
+                "deleted": true,
+            })),
+            Ok(false) => not_found(&id),
+            Err(err) => {
+                error_json(500, format!("failed to delete from the response store: {err}"))
+            }
+        },
+        Ok(None) => not_found(&id),
+        Err(err) => error_json(500, format!("failed to read the response store: {err}")),
     }
 }
 
@@ -147,7 +153,7 @@ pub async fn list_input_items(
         return response;
     }
     let id = path.into_inner();
-    match store.get_ref().get(&id) {
+    match crate::responses_limits::load_response(store.get_ref().as_ref(), &id, args.retention_secs) {
         Ok(Some(record)) => {
             let data = record.input_items;
             let first = first_identifier(&data);
@@ -220,7 +226,11 @@ mod tests {
             test::init_service(
                 App::new()
                     .app_data(web::Data::new(Arc::new(Args::parse_from([
-                        "ltengine", "--api-key", $key,
+                        "ltengine",
+                        "--api-key",
+                        $key,
+                        "--retention-secs",
+                        "0",
                     ]))))
                     .app_data(web::Data::new($store))
                     .service(get_response)

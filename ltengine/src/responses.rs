@@ -289,11 +289,12 @@ fn max_output_items(tools: &ToolRequest) -> usize {
 fn resolve_previous(
     store: &dyn ResponseStore,
     previous_response_id: Option<&str>,
+    retention_secs: u64,
 ) -> Result<Option<StoredResponse>, HttpResponse> {
     let Some(id) = previous_response_id else {
         return Ok(None);
     };
-    match store.get(id) {
+    match crate::responses_limits::load_response(store, id, retention_secs) {
         Ok(Some(record)) => Ok(Some(record)),
         Ok(None) => Err(not_found(id)),
         Err(err) => Err(error_json(
@@ -383,7 +384,11 @@ pub async fn create_response(
 
     // Resolve `previous_response_id` or `conversation` before generation, so an
     // unknown identifier is a 404 that never reaches the model (RD-22, RD-23).
-    let previous = match resolve_previous(store.get_ref().as_ref(), request.previous_response_id.as_deref()) {
+    let previous = match resolve_previous(
+        store.get_ref().as_ref(),
+        request.previous_response_id.as_deref(),
+        args.retention_secs,
+    ) {
         Ok(previous) => previous,
         Err(response) => return response,
     };
@@ -454,7 +459,30 @@ pub async fn create_response(
             user,
             input_items,
             conversation_record: conversation,
+            retention_secs: args.retention_secs,
+            max_stored_responses: args.max_stored_responses,
         });
+    }
+
+    // Remove the expired records and enforce the storage limit before the one
+    // generation attempt (`PH-6c`, `RD-25`).
+    if store_enabled {
+        match crate::responses_limits::prepare_response_write(
+            store.get_ref().as_ref(),
+            args.retention_secs,
+            args.max_stored_responses,
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                return error_json(
+                    507,
+                    crate::responses_limits::storage_full_message(args.max_stored_responses),
+                );
+            }
+            Err(err) => {
+                return error_json(500, format!("failed to prepare the response store: {err}"));
+            }
+        }
     }
 
     match llm.run_prompt_usage_grammar(system, user, grammar, &crate::llm::Reasoning::default()) {

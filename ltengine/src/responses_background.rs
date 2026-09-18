@@ -108,6 +108,9 @@ pub(crate) struct BackgroundRequest {
     pub user: String,
     pub input_items: Vec<Value>,
     pub conversation_record: Option<ConversationRecord>,
+    /// Retention and storage limits (`PH-6c`, `RD-9`, `RD-25`).
+    pub retention_secs: u64,
+    pub max_stored_responses: usize,
 }
 
 /// One background generation.
@@ -120,6 +123,22 @@ pub(crate) struct BackgroundJob {
 
 /// Store a `queued` response, start the job, and return the queued body.
 pub(crate) fn start(request: BackgroundRequest) -> HttpResponse {
+    match crate::responses_limits::prepare_response_write(
+        request.store.as_ref(),
+        request.retention_secs,
+        request.max_stored_responses,
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            return error_json(
+                507,
+                crate::responses_limits::storage_full_message(request.max_stored_responses),
+            );
+        }
+        Err(err) => {
+            return error_json(500, format!("failed to prepare the response store: {err}"));
+        }
+    }
     let id = new_id("resp_");
     let created_at = now_secs();
     let queued = build_response_object(
@@ -364,6 +383,8 @@ mod tests {
             user: "hi".to_string(),
             input_items: Vec::new(),
             conversation_record: None,
+            retention_secs: 0,
+            max_stored_responses: 0,
         }
     }
 
@@ -409,6 +430,32 @@ mod tests {
         let (record, _) = run_job(Behavior::Cancel);
         assert_eq!(record.response["status"], "cancelled");
         assert_eq!(record.response["output"], json!([]));
+    }
+
+    #[test]
+    fn storage_limit_blocks_start() {
+        // PH6C-07: a full store rejects a background write before it starts.
+        let temp = TempStoreDir::new();
+        let store: AppStore = Arc::new(FileStore::new(temp.path.clone()).expect("store dir"));
+        store
+            .put(
+                "resp_1",
+                &StoredResponse {
+                    response: json!({"id": "resp_1", "created_at": now_secs(), "status": "completed"}),
+                    input_items: Vec::new(),
+                },
+            )
+            .expect("put");
+        let mut background = request(
+            store,
+            Arc::new(FakeGenerator {
+                behavior: Behavior::Message("hi".to_string()),
+            }),
+        );
+        background.retention_secs = 0;
+        background.max_stored_responses = 1;
+        let response = start(background);
+        assert_eq!(response.status().as_u16(), 507);
     }
 
     macro_rules! service {

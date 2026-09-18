@@ -581,3 +581,34 @@ Limits of this record:
 1. Cancellation is observed at the next decoded token, so a running response can
    emit a few more tokens before it stops.
 2. A background job does not survive a process exit (`RD-22`).
+
+## 15. `PH-6c`: retention and storage limits
+
+`PH-6c` delivers `SP-PLANNED-012` under `RD-9` and `RD-25`.
+
+| Behavior | Contract |
+| -------- | -------- |
+| `--retention-secs` | Default `86400`; the value `0` disables expiry. A response older than the value is expired. |
+| Expired response | The `RD-22` 404 body on `GET`, `DELETE`, the input-item list, and `previous_response_id`. The record is removed lazily. |
+| `--max-stored-responses` | Default `1000`; the value `0` disables the limit. |
+| Before a write | Remove the expired records, then require the live count to be below the limit. |
+| At the limit | HTTP 507 with an OpenAI-shaped `server_error` body that names the limit. No new record, and no eviction of an unexpired record. |
+| Conversation item over the item limit | HTTP 400 `invalid_request_error` (`PH-6a`, unchanged). |
+
+Live evidence, local fixture, dedicated servers with small limits:
+
+| Check | Result |
+| ----- | ------ |
+| Expired response and expired `previous_response_id` | `PASS`: the `RD-22` 404 body |
+| Fresh response | `PASS`: HTTP 200 |
+| Storage limit | `PASS`: HTTP 507 with a `server_error` body that names the limit; the earlier records stay |
+| Expiry frees the count | `PASS`: a write after the retention point succeeds and the expired record returns 404 |
+| Unit tests | `PASS`: `CARGO_NET_OFFLINE=true cargo test` exits 0 with 104 passed and 0 failed |
+| Release build | `PASS`: `CARGO_NET_OFFLINE=true cargo build --release` exits 0 |
+| Preserved behavior | `PASS`: `bin/lt ph1` reports 60 ok of 60 |
+
+Limits of this record:
+
+1. The storage limit counts records, not bytes (`RD-9`).
+2. A concurrent write can pass the check before another write lands. The next
+   write rechecks the count.

@@ -20,6 +20,7 @@ mod responses_background;
 mod responses_conversations;
 mod responses_http;
 mod responses_input;
+mod responses_limits;
 mod responses_metadata;
 mod responses_retrieve;
 mod responses_schema;
@@ -88,7 +89,11 @@ struct Args {
 
     /// Maximum number of items in one conversation (0 disables the limit)
     #[arg(long, default_value_t = 100)]
-    max_conversation_items: usize
+    max_conversation_items: usize,
+
+    /// Maximum number of stored responses (0 disables the limit)
+    #[arg(long, default_value_t = 1000)]
+    max_stored_responses: usize
 }
 
 #[derive(Debug, Deserialize, Serialize)]

@@ -56,6 +56,8 @@ pub(crate) trait ResponseStore: Send + Sync {
     fn put_conversation(&self, id: &str, record: &ConversationRecord) -> io::Result<()>;
     fn get_conversation(&self, id: &str) -> io::Result<Option<ConversationRecord>>;
     fn delete_conversation(&self, id: &str) -> io::Result<bool>;
+    /// The identifiers of the live response records (`PH-6c`).
+    fn list_response_ids(&self) -> io::Result<Vec<String>>;
 }
 
 /// Shared handle that the Actix app data carries.
@@ -185,6 +187,22 @@ impl ResponseStore for FileStore {
             Err(err) => Err(err),
         }
     }
+
+    fn list_response_ids(&self) -> io::Result<Vec<String>> {
+        let mut ids = Vec::new();
+        for entry in fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(id) = name.strip_suffix(".json") else {
+                continue;
+            };
+            if name.starts_with("resp_") && valid_id(id) {
+                ids.push(id.to_string());
+            }
+        }
+        Ok(ids)
+    }
 }
 
 /// A store that always fails, for the `PH5-09` fail-closed check.
@@ -214,6 +232,10 @@ impl ResponseStore for FailingStore {
     }
 
     fn delete_conversation(&self, _id: &str) -> io::Result<bool> {
+        Err(io::Error::other("store unavailable"))
+    }
+
+    fn list_response_ids(&self) -> io::Result<Vec<String>> {
         Err(io::Error::other("store unavailable"))
     }
 }

@@ -722,7 +722,7 @@ fn unknown_previous_response_id_is_not_found() {
     // PH5-08.
     let temp = TempStoreDir::new();
     let store = FileStore::new(temp.path.clone()).expect("store dir");
-    let response = resolve_previous(&store, Some("resp_missing")).expect_err("must 404");
+    let response = resolve_previous(&store, Some("resp_missing"), 0).expect_err("must 404");
     assert_eq!(response.status(), actix_web::http::StatusCode::NOT_FOUND);
 
     let record = StoredResponse {
@@ -731,10 +731,10 @@ fn unknown_previous_response_id_is_not_found() {
     };
     store.put("resp_1", &record).expect("put");
     assert_eq!(
-        resolve_previous(&store, Some("resp_1")).expect("resolved"),
+        resolve_previous(&store, Some("resp_1"), 0).expect("resolved"),
         Some(record)
     );
-    assert_eq!(resolve_previous(&store, None).expect("none"), None);
+    assert_eq!(resolve_previous(&store, None, 0).expect("none"), None);
 }
 
 #[test]
