@@ -242,6 +242,43 @@ item 2 above. The live rows of section 7 stay the `PH-2` record of the earlier
 scripts. Rows `SP-MUST-006` and `SP-MUST-011` keep their `PH-1` gate status; the
 live correction run adds evidence to those two rows and changes no status.
 
+### 8.1 Tool request fields (post-`PH-3` correction)
+
+A second compatibility correction aligns the request contract with the OpenAI
+tool defaults. Before this change the route rejected `tools`, `tool_choice`, and
+`parallel_tool_calls` with HTTP 400, while the response body reported
+`tools: []`, `tool_choice: "none"`, and `parallel_tool_calls: false`.
+
+The corrected behavior:
+
+1. `tools` is accepted when it is absent or empty. A non-empty array returns the
+   OpenAI-shaped HTTP 400 body, and the message names `tools`.
+2. `tool_choice` is accepted when it is absent, `"none"`, or `"auto"`. Any other
+   value returns the OpenAI-shaped HTTP 400 body, and the message names
+   `tool_choice`.
+3. `parallel_tool_calls` is accepted as a boolean. It changes no behavior while
+   the route offers no tool.
+
+An empty `tools` array is the OpenAI default, so the no-tool forms match the
+OpenAI request contract. Tool calling itself stays follow-up work
+(`SP-PLANNED-004`, `SP-PLANNED-005`, roadmap `PH-4`). A request that needs a tool
+returns a clear error instead of a silent ignore (`SP-MUST-011`,
+`SP-NEVER-010`). Other unknown request fields and the unimplemented OpenAI
+generation parameters (`temperature`, `top_p`, `max_output_tokens`) stay
+rejected.
+
+Static evidence for this correction:
+
+| Check | Command | Result |
+| ----- | ------- | ------ |
+| Rust tests | `CARGO_NET_OFFLINE=true cargo test` | `PASS`: 25 tests passed, 0 failed. The inline tests `accepts_openai_tool_fields_without_a_tool_call`, `rejects_a_tool_request_naming_the_field`, and `rejects_other_unknown_fields` cover the correction. |
+| Rust build | `CARGO_NET_OFFLINE=true cargo build --release` | `PASS`: exit 0, no warning |
+| Live gate | `bin/lt ph1` | `PASS`: 60 checks ok, 0 mismatch, exit 0 |
+
+This correction changes no other decision outcome. The `PH-2` rows of section 7
+keep their status. The success body is unchanged, so the live `tools` `[]` check
+of section 8 stays valid.
+
 ## 9. `PH-3`: SSE streaming and token usage
 
 The `PH-3` gate result is `PASS`. The phase delivers `SP-PLANNED-001` (SSE text

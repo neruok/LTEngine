@@ -20,9 +20,11 @@ use crate::llm;
 
 /// Request body of `POST /v1/responses`.
 ///
-/// `deny_unknown_fields` rejects `tools` and every other unsupported field with
-/// a 400 instead of silently ignoring it. `metadata` is the one carried field:
-/// its OpenAI limits are validated, and an accepted value is echoed.
+/// `deny_unknown_fields` rejects an unsupported field with a 400 instead of
+/// silently ignoring it. The OpenAI tool fields `tools`, `tool_choice`, and
+/// `parallel_tool_calls` are accepted in their no-tool forms; a tool request
+/// returns a clear error (`validate_tool_fields`). `metadata` is the one carried
+/// field: its OpenAI limits are validated, and an accepted value is echoed.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateRequest {
@@ -44,6 +46,20 @@ pub struct CreateRequest {
     /// (RD-4); `parse_and_authorize` rejects it with a clear 400.
     #[serde(default)]
     pub api_key: Option<serde_json::Value>,
+    /// OpenAI tool definitions. Tool calling is `PH-4` work, so a non-empty
+    /// array returns a clear 400 that names `tools`. An empty array is the
+    /// OpenAI default and calls no tool.
+    #[serde(default)]
+    pub tools: Option<Vec<serde_json::Value>>,
+    /// OpenAI tool choice. `none` and `auto` are accepted because the route
+    /// offers no tool. Any other value returns a clear 400 that names
+    /// `tool_choice`. A named function is `PH-4` work (`SP-PLANNED-004`).
+    #[serde(default)]
+    pub tool_choice: Option<serde_json::Value>,
+    /// OpenAI parallel-call switch. Accepted: it has no effect while the route
+    /// offers no tool (`SP-PLANNED-005`).
+    #[serde(default)]
+    pub parallel_tool_calls: Option<bool>,
 }
 
 /// OpenAI `metadata` limits: at most 16 entries, key at most 64 characters,
@@ -227,7 +243,43 @@ fn validate(
             ));
         }
     }
+    validate_tool_fields(request).map_err(|message| (400, message))?;
     map_input(request.instructions.as_deref(), &request.input).map_err(|err| (400, err))
+}
+
+/// Validate the OpenAI tool fields before generation.
+///
+/// Tool calling is `PH-4` work. The route therefore accepts only the no-tool
+/// forms: an empty `tools` array, and `tool_choice` `none` or `auto`.
+/// `parallel_tool_calls` is accepted because it changes no behavior while the
+/// route offers no tool. A request that needs a tool returns a clear error that
+/// names the field instead of a silent ignore (`SP-MUST-011`, `SP-NEVER-010`).
+fn validate_tool_fields(request: &CreateRequest) -> Result<(), String> {
+    // Accepted and intentionally unused: `parallel_tool_calls` changes no
+    // behavior while the route offers no tool (`SP-PLANNED-005`). The read keeps
+    // the accepted field from being dead code.
+    let _ = request.parallel_tool_calls;
+    if request
+        .tools
+        .as_ref()
+        .is_some_and(|tools| !tools.is_empty())
+    {
+        return Err(
+            "tool calling is not implemented on this route; `tools` must be empty".to_string(),
+        );
+    }
+    match request.tool_choice.as_ref() {
+        None => Ok(()),
+        Some(serde_json::Value::String(choice)) if choice == "none" || choice == "auto" => Ok(()),
+        Some(serde_json::Value::String(_)) => Err(
+            "`tool_choice` must be `none` or `auto` on this route; tool calling is not implemented"
+                .to_string(),
+        ),
+        Some(_) => Err(
+            "`tool_choice` must be the string `none` or `auto` on this route; tool calling is not implemented"
+                .to_string(),
+        ),
+    }
 }
 
 /// Parse the body before the credential check. This order is RD-4: a request
@@ -841,11 +893,54 @@ mod tests {
     }
 
     #[test]
-    fn rejects_tools_and_other_unsupported_fields() {
+    fn accepts_openai_tool_fields_without_a_tool_call() {
+        // The response body reports `tools: []`, `tool_choice: "none"`, and
+        // `parallel_tool_calls: false`, so the request must accept the same
+        // no-tool forms instead of rejecting the fields with a 400.
         for json in [
             r#"{"input":"hi","tools":[]}"#,
             r#"{"input":"hi","tool_choice":"none"}"#,
+            r#"{"input":"hi","tool_choice":"auto"}"#,
             r#"{"input":"hi","parallel_tool_calls":false}"#,
+            r#"{"input":"hi","parallel_tool_calls":true}"#,
+            r#"{"input":"hi","tools":[],"tool_choice":"auto","parallel_tool_calls":true}"#,
+        ] {
+            let request = parse(json);
+            assert!(validate(&request, "gemma3-4b").is_ok(), "{json}");
+        }
+    }
+
+    #[test]
+    fn rejects_a_tool_request_naming_the_field() {
+        // Tool calling is PH-4 work. A request that needs it fails with a clear
+        // 400 that names the field, never a silent ignore (SP-MUST-011).
+        for (json, field) in [
+            (
+                r#"{"input":"hi","tools":[{"type":"function","name":"f"}]}"#,
+                "tools",
+            ),
+            (r#"{"input":"hi","tool_choice":"required"}"#, "tool_choice"),
+            (r#"{"input":"hi","tool_choice":"bogus"}"#, "tool_choice"),
+            (
+                r#"{"input":"hi","tool_choice":{"type":"function","name":"f"}}"#,
+                "tool_choice",
+            ),
+        ] {
+            let request = parse(json);
+            let (status, message) = validate(&request, "gemma3-4b").unwrap_err();
+            assert_eq!(status, 400, "{json}");
+            assert!(message.contains(field), "{json} -> {message}");
+        }
+    }
+
+    #[test]
+    fn rejects_other_unknown_fields() {
+        // A field the route does not implement still fails with a 400. That
+        // includes the OpenAI generation parameters, which stay rejected until
+        // a phase implements them and their behavior is defined.
+        for json in [
+            r#"{"input":"hi","bogus":1}"#,
+            r#"{"input":"hi","temperature":0.5}"#,
         ] {
             assert!(
                 serde_json::from_str::<CreateRequest>(json).is_err(),
