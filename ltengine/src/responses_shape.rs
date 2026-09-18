@@ -181,6 +181,10 @@ fn push_event(body: &mut String, sequence: &mut u32, event_type: &str, mut paylo
 
 /// Build the SSE body of a successful `stream: true` request (RD-17, RD-20).
 ///
+/// Returns the body text and the completed response object, so the caller can
+/// store the response (`PH-5`, RD-22) with the same identifier that the stream
+/// carries.
+///
 /// A text message keeps the `RD-17` order: `response.created`,
 /// `response.in_progress`, `response.output_item.added`,
 /// `response.content_part.added`, zero or more `response.output_text.delta`,
@@ -205,7 +209,7 @@ pub(crate) fn build_stream_body(
     echo: &ToolEcho,
     metadata: Option<&Value>,
     usage: &llm::TokenUsage,
-) -> String {
+) -> (String, Value) {
     let response_id = new_id("resp_");
     let created_at = now_secs();
     // Build the final items once so the per-item events and the completed body
@@ -376,7 +380,7 @@ pub(crate) fn build_stream_body(
         &mut body,
         &mut sequence,
         "response.completed",
-        json!({"response": completed}),
+        json!({"response": completed.clone()}),
     );
-    body
+    (body, completed)
 }

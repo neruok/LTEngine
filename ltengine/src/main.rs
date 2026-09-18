@@ -16,10 +16,13 @@ mod llm;
 mod banner;
 mod prompt;
 mod responses;
+mod responses_http;
 mod responses_input;
 mod responses_metadata;
+mod responses_retrieve;
 mod responses_schema;
 mod responses_shape;
+mod responses_store;
 mod responses_tools;
 
 use languages::{detect_lang, get_language_from_code, LANGUAGES};
@@ -71,7 +74,11 @@ struct Args {
 
     /// Enable verbose logging
     #[arg(short = 'v', long)]
-    verbose: bool
+    verbose: bool,
+
+    /// Directory for stored Responses API responses
+    #[arg(long, default_value = "./ltengine-responses")]
+    store_dir: String
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -371,6 +378,13 @@ async fn main() -> std::io::Result<()> {
 
     print_banner();
 
+    let store: crate::responses_store::AppStore = Arc::new(
+        crate::responses_store::FileStore::new(PathBuf::from(&args.store_dir)).unwrap_or_else(|err| {
+            eprintln!("Failed to create the response store directory: {}", err);
+            std::process::exit(1);
+        }),
+    );
+
     let server = HttpServer::new(move || {
         let generated = generate();
 
@@ -378,6 +392,7 @@ async fn main() -> std::io::Result<()> {
             // .service(index)
             .app_data(web::Data::new(llm.clone()))
             .app_data(web::Data::new(args.clone()))
+            .app_data(web::Data::new(store.clone()))
             .service(get_languages)
             .service(get_frontend_settings)
             .service(translate)
@@ -385,6 +400,9 @@ async fn main() -> std::io::Result<()> {
             .service(detect)
             .service(suggest)
             .service(responses::create_response)
+            .service(responses_retrieve::get_response)
+            .service(responses_retrieve::delete_response)
+            .service(responses_retrieve::list_input_items)
             .service(ResourceFiles::new("/", generated))
     })
     .bind((host.clone(), port))?

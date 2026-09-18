@@ -453,3 +453,49 @@ Limits of this record:
 
 `SP-PLANNED-003` is delivered by `PH-4a` (section 10). This profile still claims
 no full OpenAI parity (`SP-NEVER-012`).
+
+## 12. `PH-5`: stored responses and retrieval
+
+`PH-5` delivers `SP-PLANNED-006` through `SP-PLANNED-009`. The route family now
+stores a response by default, chains with `previous_response_id`, and answers
+retrieval, deletion, and input-item listing.
+
+| Behavior | Contract |
+| -------- | -------- |
+| `store` | Boolean, default `true`. `true` stores the completed response. `false` does not, so it is not retrievable. |
+| `previous_response_id` | Prepends the referenced record's input items, then its output items as input items, then the request input. The referenced `instructions` are not carried. Chaining is transitive. |
+| `GET /v1/responses/{response_id}` | HTTP 200 with the stored response object, equal to the created body. |
+| `DELETE /v1/responses/{response_id}` | HTTP 200 with `{"id":"<id>","object":"response","deleted":true}`. |
+| `GET /v1/responses/{response_id}/input_items` | HTTP 200 with `{"object":"list","data":[...],"first_id":...,"last_id":...,"has_more":false}`. |
+| Unknown or deleted id | HTTP 404 with `{"error":{"message":"No response found with id '<id>'","type":"invalid_request_error","param":null,"code":null}}`. |
+| Unsupported query field | HTTP 400 that names the field (`CC-6`), including `stream=true`. |
+| Store layout | One JSON file per response at `<store-dir>/<resp_id>.json`. `--store-dir` defaults to `./ltengine-responses` and is created at startup. |
+| Write failure | One attempt, fail-closed with HTTP 500 `server_error` (`RD-15`). |
+
+Live evidence, local fixture `http://127.0.0.1:5051`, key `ph1-test-key`,
+loaded model = the full `--model-file` GGUF path:
+
+| Check | Result |
+| ----- | ------ |
+| Create then retrieve | `PASS`: `GET` returns a body equal to the created body |
+| Input-item list | `PASS`: `object` `list`, one item for a string input, `has_more` `false` |
+| `previous_response_id` | `PASS`: the chained record stores three items in order (first input, first output as an assistant message, new input) |
+| `store:false` | `PASS`: HTTP 200 on create, HTTP 404 on `GET` |
+| Unknown id | `PASS`: HTTP 404 with the body above |
+| `previous_response_id` unknown | `PASS`: HTTP 404 with the body above |
+| `DELETE` then `GET` | `PASS`: `{"id","object":"response","deleted":true}`, then HTTP 404 |
+| `DELETE` unknown | `PASS`: HTTP 404 with the body above |
+| Traversal-shaped id | `PASS`: HTTP 404, no path outside the store |
+| `GET ...?stream=true` | `PASS`: HTTP 400 naming `stream` |
+| Missing bearer | `PASS`: HTTP 401 |
+| Unit tests | `PASS`: `CARGO_NET_OFFLINE=true cargo test` exits 0 with 65 passed and 0 failed |
+| Release build | `PASS`: `CARGO_NET_OFFLINE=true cargo build --release` exits 0 |
+| Preserved behavior | `PASS`: `bin/lt ph1` reports 60 ok of 60 |
+
+Limits of this record:
+
+1. Replay of a stored response through `GET ...?stream=true` is not implemented.
+   Retrieval returns HTTP 400 that names `stream`. `RD-13` maps replay to
+   `SP-PLANNED-008`, so this needs an owner decision.
+2. The input-item list has no pagination and no ordering parameter.
+3. Retention limits and storage limits stay `RD-9` and `RD-25` (`PH-6`).
