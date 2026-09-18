@@ -16,6 +16,11 @@ mod llm;
 mod banner;
 mod prompt;
 mod responses;
+mod responses_input;
+mod responses_metadata;
+mod responses_schema;
+mod responses_shape;
+mod responses_tools;
 
 use languages::{detect_lang, get_language_from_code, LANGUAGES};
 use error_response::ErrorResponse;

@@ -1,29 +1,37 @@
-//! `POST /v1/responses` (roadmap PH-1 and PH-3).
+//! `POST /v1/responses` (roadmap PH-1, PH-3, PH-4a).
 //!
-//! The route is a text adapter over `LLM::run_prompt_usage`. It is not an
+//! The route is a text adapter over `LLM::run_prompt_usage_grammar`. It is not an
 //! OpenAI proxy: no upstream call, no second decode path. Only this route uses
 //! the OpenAI-shaped nested error body; the existing LibreTranslate routes keep
 //! their flat `{"error": "<string>"}` body.
 //!
 //! `stream: true` answers with `text/event-stream` (PH-3, RD-17). The body is one
 //! generation attempt and carries the exact token usage of RD-18.
+//!
+//! `text.format` follows the OpenAI contract (PH-4a, RD-19). The request types and
+//! the schema-to-grammar derivation live in `responses_schema.rs`; the response
+//! object and the SSE events live in `responses_shape.rs`.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use actix_web::{HttpRequest, HttpResponse, http::StatusCode, http::header, post, web};
 use serde::Deserialize;
 
 use crate::Args;
 use crate::llm;
+use crate::responses_schema::{derive_format, ResponseTextConfig, StructuredFormat};
+use crate::responses_shape::{
+    StreamOutput, build_response, build_stream_body, calls_output, message_output,
+};
+use crate::responses_tools::{ModelTurn, ToolEcho, ToolRequest, parse_tools, parse_turn};
+use crate::responses_input::{ResponseInput, map_input};
 
 /// Request body of `POST /v1/responses`.
 ///
 /// `deny_unknown_fields` rejects an unsupported field with a 400 instead of
 /// silently ignoring it. The OpenAI tool fields `tools`, `tool_choice`, and
-/// `parallel_tool_calls` are accepted in their no-tool forms; a tool request
-/// returns a clear error (`validate_tool_fields`). `metadata` is the one carried
+/// `parallel_tool_calls` are validated by `parse_tools`; a tool request that
+/// the route cannot honor returns a clear error. `metadata` is the one carried
 /// field: its OpenAI limits are validated, and an accepted value is echoed.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -40,177 +48,34 @@ pub struct CreateRequest {
     /// `METADATA_MAX_ENTRIES`, `METADATA_MAX_KEY_CHARS`, and
     /// `METADATA_MAX_VALUE_CHARS`. An accepted value is echoed in the
     /// successful response (`null` when absent or `null`).
-    #[serde(default, deserialize_with = "deserialize_metadata")]
+    #[serde(default, deserialize_with = "crate::responses_metadata::deserialize_metadata")]
     pub metadata: Option<serde_json::Value>,
+    /// OpenAI structured-output configuration (PH-4a). `text.format` selects the
+    /// response format; `derive_format` validates it and derives the grammar.
+    #[serde(default)]
+    pub text: Option<ResponseTextConfig>,
     /// The LibreTranslate-style body credential. This route does not accept it
     /// (RD-4); `parse_and_authorize` rejects it with a clear 400.
     #[serde(default)]
     pub api_key: Option<serde_json::Value>,
-    /// OpenAI tool definitions. Tool calling is `PH-4` work, so a non-empty
-    /// array returns a clear 400 that names `tools`. An empty array is the
-    /// OpenAI default and calls no tool.
+    /// OpenAI tool definitions (PH-4b). A `function` tool is accepted and
+    /// offered to the model through the transcription envelope. A tool of any
+    /// other type returns a clear 400 that names `tools`. An empty array is the
+    /// OpenAI default and calls no tool. `parse_tools` validates the entries.
     #[serde(default)]
     pub tools: Option<Vec<serde_json::Value>>,
-    /// OpenAI tool choice. `none` and `auto` are accepted because the route
-    /// offers no tool. Any other value returns a clear 400 that names
-    /// `tool_choice`. A named function is `PH-4` work (`SP-PLANNED-004`).
+    /// OpenAI tool choice. `none`, `auto`, `required`, and
+    /// `{"type":"function","name":"<declared>"}` are accepted (PH-4b). Any
+    /// other value returns a clear 400 that names `tool_choice`.
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
-    /// OpenAI parallel-call switch. Accepted: it has no effect while the route
-    /// offers no tool (`SP-PLANNED-005`).
+    /// OpenAI parallel-call switch. `true` permits more than one
+    /// `function_call` item; `false` permits at most one (PH-4b,
+    /// `SP-PLANNED-005`).
     #[serde(default)]
     pub parallel_tool_calls: Option<bool>,
 }
 
-/// OpenAI `metadata` limits: at most 16 entries, key at most 64 characters,
-/// value at most 512 characters. Every bound is inclusive.
-const METADATA_MAX_ENTRIES: usize = 16;
-const METADATA_MAX_KEY_CHARS: usize = 64;
-const METADATA_MAX_VALUE_CHARS: usize = 512;
-
-/// Reject an invalid `metadata` at parse time, so the OpenAI-shaped 400 body
-/// carries a message that names `metadata` (SP-MUST-011).
-fn deserialize_metadata<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let metadata = Option::<serde_json::Value>::deserialize(deserializer)?;
-    validate_metadata(metadata.as_ref()).map_err(serde::de::Error::custom)?;
-    Ok(metadata)
-}
-
-fn validate_metadata(metadata: Option<&serde_json::Value>) -> Result<(), String> {
-    let Some(metadata) = metadata.filter(|value| !value.is_null()) else {
-        return Ok(());
-    };
-    let Some(entries) = metadata.as_object() else {
-        return Err("metadata must be an object of string values".to_string());
-    };
-    if entries.len() > METADATA_MAX_ENTRIES {
-        return Err(format!(
-            "metadata must have at most {METADATA_MAX_ENTRIES} entries, got {}",
-            entries.len()
-        ));
-    }
-    for (key, value) in entries {
-        if key.chars().count() > METADATA_MAX_KEY_CHARS {
-            return Err(format!(
-                "metadata key `{key}` is too long: at most {METADATA_MAX_KEY_CHARS} characters"
-            ));
-        }
-        let Some(value) = value.as_str() else {
-            return Err(format!("metadata value for key `{key}` must be a string"));
-        };
-        if value.chars().count() > METADATA_MAX_VALUE_CHARS {
-            return Err(format!(
-                "metadata value for key `{key}` is too long: at most {METADATA_MAX_VALUE_CHARS} characters"
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// `input` is a plain string or a message array.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum ResponseInput {
-    Text(String),
-    Messages(Vec<Message>),
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Message {
-    pub role: String,
-    pub content: MessageContent,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum MessageContent {
-    Text(String),
-    Parts(Vec<ContentPart>),
-}
-
-/// `extra` captures every undeclared field, and `message_text` rejects a
-/// captured field, so an unknown field is never silently ignored
-/// (SP-NEVER-010). The capture is what lets a native modality payload (for
-/// example `input_image` with `image_url`) reach the clear unsupported-modality
-/// error instead of a generic unknown-field error (SP-MUST-011).
-#[derive(Debug, Deserialize)]
-pub struct ContentPart {
-    #[serde(rename = "type")]
-    pub kind: String,
-    #[serde(default)]
-    pub text: Option<String>,
-    #[serde(flatten)]
-    pub extra: serde_json::Map<String, serde_json::Value>,
-}
-
-const SYSTEM_ROLES: [&str; 2] = ["system", "developer"];
-const TEXT_ROLES: [&str; 4] = ["system", "developer", "user", "assistant"];
-
-/// Map `instructions` and `input` onto the `run_prompt(system, user)` pair.
-///
-/// `ponytail:` message roles collapse into two text blocks, so a multi-turn
-/// conversation is flattened. Fine for a single text generation; revisit if a
-/// client needs the turn structure preserved.
-pub fn map_input(
-    instructions: Option<&str>,
-    input: &ResponseInput,
-) -> Result<(String, String), String> {
-    let mut system: Vec<String> = Vec::new();
-    if let Some(instructions) = instructions {
-        system.push(instructions.to_string());
-    }
-
-    let mut user: Vec<String> = Vec::new();
-    match input {
-        ResponseInput::Text(text) => user.push(text.clone()),
-        ResponseInput::Messages(messages) => {
-            for message in messages {
-                let text = message_text(message)?;
-                if SYSTEM_ROLES.contains(&message.role.as_str()) {
-                    system.push(text);
-                } else {
-                    user.push(text);
-                }
-            }
-        }
-    }
-
-    Ok((system.join("\n"), user.join("\n")))
-}
-
-fn message_text(message: &Message) -> Result<String, String> {
-    if !TEXT_ROLES.contains(&message.role.as_str()) {
-        return Err(format!("unsupported message role: {}", message.role));
-    }
-
-    match &message.content {
-        MessageContent::Text(text) => Ok(text.clone()),
-        MessageContent::Parts(parts) => {
-            let mut texts = Vec::new();
-            for part in parts {
-                if part.kind != "input_text" && part.kind != "output_text" {
-                    return Err(format!("unsupported modality: {}", part.kind));
-                }
-                if let Some(field) = part.extra.keys().next() {
-                    return Err(format!(
-                        "unsupported modality field `{field}` on content type {}",
-                        part.kind
-                    ));
-                }
-                let text = part
-                    .text
-                    .clone()
-                    .ok_or_else(|| "content part is missing text".to_string())?;
-                texts.push(text);
-            }
-            Ok(texts.join("\n"))
-        }
-    }
-}
 
 /// Canonical loaded-model identifier shared by request validation and the
 /// success response echo (SP-MUST-009, RD-5). `--model-file` overrides
@@ -223,15 +88,22 @@ fn loaded_model_identifier(args: &Args) -> String {
     }
 }
 
+/// A validated request: the prompt pair, the decoded `text.format` effect, and
+/// the accepted tool request.
+#[derive(Debug)]
+struct PreparedPrompt {
+    system: String,
+    user: String,
+    format: StructuredFormat,
+    tools: ToolRequest,
+}
+
 /// Validate every supported-statefulness and model choice before generation.
 ///
 /// `stream` is not validated here: `stream: true` selects the SSE response of
 /// `build_stream_body` (RD-17). Every rejection below happens before the first
 /// event, so it uses the normal OpenAI-shaped HTTP error (RD-13).
-fn validate(
-    request: &CreateRequest,
-    loaded_model: &str,
-) -> Result<(String, String), (u16, String)> {
+fn validate(request: &CreateRequest, loaded_model: &str) -> Result<PreparedPrompt, (u16, String)> {
     if let Some(model) = &request.model {
         if model != loaded_model {
             return Err((
@@ -243,43 +115,46 @@ fn validate(
             ));
         }
     }
-    validate_tool_fields(request).map_err(|message| (400, message))?;
-    map_input(request.instructions.as_deref(), &request.input).map_err(|err| (400, err))
+    let tools = parse_tools(
+        request.tools.as_ref(),
+        request.tool_choice.as_ref(),
+        request.parallel_tool_calls,
+    )
+    .map_err(|message| (400, message))?;
+    let format = derive_format(request.text.as_ref()).map_err(|message| (400, message))?;
+    if tools.offers_tools() && format.json_required {
+        // Combining the tool envelope with a structured output format needs two
+        // grammars. The route does not implement the combination, so it
+        // returns a clear error instead of mishandling it (`SP-NEVER-010`).
+        return Err((
+            400,
+            "`tools` and a structured `text.format` cannot be combined on this route".to_string(),
+        ));
+    }
+    let (mut system, user) =
+        map_input(request.instructions.as_deref(), &request.input).map_err(|err| (400, err))?;
+    if let Some(note) = tools.system_note() {
+        if !system.is_empty() {
+            system.push('\n');
+        }
+        system.push_str(&note);
+    }
+    Ok(PreparedPrompt {
+        system,
+        user,
+        format,
+        tools,
+    })
 }
 
-/// Validate the OpenAI tool fields before generation.
-///
-/// Tool calling is `PH-4` work. The route therefore accepts only the no-tool
-/// forms: an empty `tools` array, and `tool_choice` `none` or `auto`.
-/// `parallel_tool_calls` is accepted because it changes no behavior while the
-/// route offers no tool. A request that needs a tool returns a clear error that
-/// names the field instead of a silent ignore (`SP-MUST-011`, `SP-NEVER-010`).
-fn validate_tool_fields(request: &CreateRequest) -> Result<(), String> {
-    // Accepted and intentionally unused: `parallel_tool_calls` changes no
-    // behavior while the route offers no tool (`SP-PLANNED-005`). The read keeps
-    // the accepted field from being dead code.
-    let _ = request.parallel_tool_calls;
-    if request
-        .tools
-        .as_ref()
-        .is_some_and(|tools| !tools.is_empty())
-    {
-        return Err(
-            "tool calling is not implemented on this route; `tools` must be empty".to_string(),
-        );
-    }
-    match request.tool_choice.as_ref() {
-        None => Ok(()),
-        Some(serde_json::Value::String(choice)) if choice == "none" || choice == "auto" => Ok(()),
-        Some(serde_json::Value::String(_)) => Err(
-            "`tool_choice` must be `none` or `auto` on this route; tool calling is not implemented"
-                .to_string(),
-        ),
-        Some(_) => Err(
-            "`tool_choice` must be the string `none` or `auto` on this route; tool calling is not implemented"
-                .to_string(),
-        ),
-    }
+/// `json_object` and `json_schema` require the generated text to parse as JSON
+/// (RD-19). A `strict: true` schema is already guaranteed by the grammar; this
+/// check covers `json_object` and non-strict `json_schema`. A non-conforming
+/// output is never returned as a valid body (`SP-NEVER-010`).
+fn require_json(text: &str) -> Result<(), String> {
+    serde_json::from_str::<serde_json::Value>(text.trim())
+        .map(|_| ())
+        .map_err(|err| format!("the model did not produce valid JSON for `text.format`: {err}"))
 }
 
 /// Parse the body before the credential check. This order is RD-4: a request
@@ -341,259 +216,6 @@ fn error_json(status: u16, message: String) -> HttpResponse {
         }))
 }
 
-static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-
-fn new_id(prefix: &str) -> String {
-    let count = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("{prefix}{nanos:x}{count:x}")
-}
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// One `output_text` content part.
-fn output_text_part(text: &str) -> serde_json::Value {
-    serde_json::json!({"type": "output_text", "text": text, "annotations": []})
-}
-
-/// One assistant `message` output item. `text` is `None` while the item is in
-/// progress, because its content part arrives in a later event.
-fn message_item(item_id: &str, status: &str, text: Option<&str>) -> serde_json::Value {
-    let content = match text {
-        Some(text) => serde_json::json!([output_text_part(text)]),
-        None => serde_json::json!([]),
-    };
-    serde_json::json!({
-        "id": item_id,
-        "type": "message",
-        "status": status,
-        "role": "assistant",
-        "content": content,
-    })
-}
-
-/// The exact `usage` object of RD-18. `total_tokens` is the exact sum of the two
-/// exact counts. No value is an estimate (`SP-NEVER-010`).
-fn usage_json(usage: &llm::TokenUsage) -> serde_json::Value {
-    serde_json::json!({
-        "input_tokens": usage.input_tokens,
-        "output_tokens": usage.output_tokens,
-        "total_tokens": usage.total_tokens(),
-    })
-}
-
-/// The OpenAI-shaped response object, shared by the non-streaming body and the
-/// `response.completed` and `response.in_progress` events.
-fn response_object(
-    id: &str,
-    created_at: u64,
-    status: &str,
-    model: &str,
-    metadata: Option<&serde_json::Value>,
-    output: serde_json::Value,
-    usage: serde_json::Value,
-) -> serde_json::Value {
-    serde_json::json!({
-        "id": id,
-        "object": "response",
-        "created_at": created_at,
-        "status": status,
-        "model": model,
-        "metadata": metadata,
-        "parallel_tool_calls": false,
-        "tool_choice": "none",
-        "tools": [],
-        "output": output,
-        "usage": usage,
-    })
-}
-
-/// OpenAI-shaped non-streaming response. `usage` carries the exact counts of
-/// the one generation (PH-3, RD-18). `parallel_tool_calls`, `tool_choice`, and
-/// `tools` are the truthful values of the text-only route: it offers no tool and
-/// calls no tool. `metadata` echoes the accepted request value, or `null` when
-/// the request carried none.
-fn build_response(
-    model: &str,
-    text: &str,
-    metadata: Option<&serde_json::Value>,
-    usage: &llm::TokenUsage,
-) -> serde_json::Value {
-    response_object(
-        &new_id("resp_"),
-        now_secs(),
-        "completed",
-        model,
-        metadata,
-        serde_json::json!([message_item(&new_id("msg_"), "completed", Some(text))]),
-        usage_json(usage),
-    )
-}
-
-/// Append one SSE frame. The frame carries the OpenAI event name line and the
-/// JSON payload line. The payload carries its event `type` and the next
-/// `sequence_number` (RD-17).
-fn push_event(
-    body: &mut String,
-    sequence: &mut u32,
-    event_type: &str,
-    mut payload: serde_json::Value,
-) {
-    let map = payload
-        .as_object_mut()
-        .expect("an event payload is a JSON object");
-    map.insert("type".to_string(), serde_json::Value::from(event_type));
-    map.insert(
-        "sequence_number".to_string(),
-        serde_json::Value::from(*sequence),
-    );
-    *sequence += 1;
-    body.push_str("event: ");
-    body.push_str(event_type);
-    body.push_str("\ndata: ");
-    body.push_str(&payload.to_string());
-    body.push_str("\n\n");
-}
-
-/// Build the SSE body of a successful `stream: true` request (RD-17).
-///
-/// The event order is exactly `response.created`, `response.in_progress`,
-/// `response.output_item.added`, `response.content_part.added`, zero or more
-/// `response.output_text.delta`, `response.output_text.done`,
-/// `response.content_part.done`, `response.output_item.done`, and
-/// `response.completed`. `PH-3` makes one generation attempt and emits no
-/// `response.failed`, because every failure happens before the first event
-/// (RD-13).
-///
-/// `ponytail:` the body is built after the single generation attempt, so it
-/// carries one delta with the whole text. RD-17 permits zero or more delta
-/// events, and `clean_output` can retract text at the end, so the whole text is
-/// the only safe delta. Emit finer deltas when the decode path can hand out text
-/// that the cleanup will not retract.
-fn build_stream_body(
-    model: &str,
-    text: &str,
-    metadata: Option<&serde_json::Value>,
-    usage: &llm::TokenUsage,
-) -> String {
-    let response_id = new_id("resp_");
-    let item_id = new_id("msg_");
-    let created_at = now_secs();
-    let output_index = 0;
-    let content_index = 0;
-    let in_progress = response_object(
-        &response_id,
-        created_at,
-        "in_progress",
-        model,
-        metadata,
-        serde_json::json!([]),
-        serde_json::Value::Null,
-    );
-    let completed = response_object(
-        &response_id,
-        created_at,
-        "completed",
-        model,
-        metadata,
-        serde_json::json!([message_item(&item_id, "completed", Some(text))]),
-        usage_json(usage),
-    );
-
-    let mut sequence = 0_u32;
-    let mut body = String::new();
-    push_event(
-        &mut body,
-        &mut sequence,
-        "response.created",
-        serde_json::json!({"response": in_progress}),
-    );
-    push_event(
-        &mut body,
-        &mut sequence,
-        "response.in_progress",
-        serde_json::json!({"response": in_progress}),
-    );
-    push_event(
-        &mut body,
-        &mut sequence,
-        "response.output_item.added",
-        serde_json::json!({
-            "output_index": output_index,
-            "item": message_item(&item_id, "in_progress", None),
-        }),
-    );
-    push_event(
-        &mut body,
-        &mut sequence,
-        "response.content_part.added",
-        serde_json::json!({
-            "item_id": item_id,
-            "output_index": output_index,
-            "content_index": content_index,
-            "part": output_text_part(""),
-        }),
-    );
-    push_event(
-        &mut body,
-        &mut sequence,
-        "response.output_text.delta",
-        serde_json::json!({
-            "item_id": item_id,
-            "output_index": output_index,
-            "content_index": content_index,
-            "delta": text,
-            "logprobs": [],
-        }),
-    );
-    push_event(
-        &mut body,
-        &mut sequence,
-        "response.output_text.done",
-        serde_json::json!({
-            "item_id": item_id,
-            "output_index": output_index,
-            "content_index": content_index,
-            "text": text,
-        }),
-    );
-    push_event(
-        &mut body,
-        &mut sequence,
-        "response.content_part.done",
-        serde_json::json!({
-            "item_id": item_id,
-            "output_index": output_index,
-            "content_index": content_index,
-            "part": output_text_part(text),
-        }),
-    );
-    push_event(
-        &mut body,
-        &mut sequence,
-        "response.output_item.done",
-        serde_json::json!({
-            "output_index": output_index,
-            "item": message_item(&item_id, "completed", Some(text)),
-        }),
-    );
-    push_event(
-        &mut body,
-        &mut sequence,
-        "response.completed",
-        serde_json::json!({"response": completed}),
-    );
-    body
-}
-
 #[post("/v1/responses")]
 pub async fn create_response(
     req: HttpRequest,
@@ -617,28 +239,76 @@ pub async fn create_response(
     };
 
     let loaded_model = loaded_model_identifier(&args);
-    let (system, user) = match validate(&request, &loaded_model) {
-        Ok(prompt) => prompt,
+    let prepared = match validate(&request, &loaded_model) {
+        Ok(prepared) => prepared,
         Err((status, message)) => return error_json(status, message),
     };
+    let PreparedPrompt {
+        system,
+        user,
+        format,
+        tools,
+    } = prepared;
 
-    // `RD-25` reasoning support is added with the request field; this commit
-    // only threads the parameter through the generation path.
-    match llm.run_prompt_usage(system, user, &llm::Reasoning::default()) {
-        Ok((text, usage)) if request.stream == Some(true) => HttpResponse::Ok()
-            .content_type("text/event-stream")
-            .body(build_stream_body(
-                &loaded_model,
-                &text,
-                request.metadata.as_ref(),
-                &usage,
-            )),
-        Ok((text, usage)) => HttpResponse::Ok().json(build_response(
-            &loaded_model,
-            &text,
-            request.metadata.as_ref(),
-            &usage,
-        )),
+    let streaming = request.stream == Some(true);
+    let grammar = if tools.offers_tools() {
+        tools.grammar.as_deref()
+    } else {
+        format.grammar.as_deref()
+    };
+
+    match llm.run_prompt_usage_grammar(system, user, grammar, &crate::llm::Reasoning::default()) {
+        Ok((text, usage)) => {
+            let echo = ToolEcho::from_request(&tools);
+            if tools.offers_tools() {
+                // The model answers with the transcription envelope (RD-20).
+                return match parse_turn(&text, &tools) {
+                    Ok(ModelTurn::Message(answer)) => {
+                        if streaming {
+                            sse_body(&loaded_model, StreamOutput::Text(&answer), &echo, request.metadata.as_ref(), &usage)
+                        } else {
+                            HttpResponse::Ok().json(build_response(
+                                &loaded_model,
+                                message_output(&answer),
+                                &echo,
+                                request.metadata.as_ref(),
+                                &usage,
+                            ))
+                        }
+                    }
+                    Ok(ModelTurn::Calls(calls)) => {
+                        if streaming {
+                            sse_body(&loaded_model, StreamOutput::Calls(&calls), &echo, request.metadata.as_ref(), &usage)
+                        } else {
+                            HttpResponse::Ok().json(build_response(
+                                &loaded_model,
+                                calls_output(&calls),
+                                &echo,
+                                request.metadata.as_ref(),
+                                &usage,
+                            ))
+                        }
+                    }
+                    Err(message) => error_json(500, message),
+                };
+            }
+            if format.json_required {
+                if let Err(message) = require_json(&text) {
+                    return error_json(500, message);
+                }
+            }
+            if streaming {
+                sse_body(&loaded_model, StreamOutput::Text(&text), &echo, request.metadata.as_ref(), &usage)
+            } else {
+                HttpResponse::Ok().json(build_response(
+                    &loaded_model,
+                    message_output(&text),
+                    &echo,
+                    request.metadata.as_ref(),
+                    &usage,
+                ))
+            }
+        }
         Err(err) => {
             let status = match err.downcast_ref::<llm::LLMError>() {
                 Some(llm::LLMError::Busy) => 503,
@@ -650,10 +320,29 @@ pub async fn create_response(
     }
 }
 
+/// The SSE success response for one generated turn (RD-17, RD-20).
+fn sse_body(
+    model: &str,
+    output: StreamOutput<'_>,
+    echo: &ToolEcho,
+    metadata: Option<&serde_json::Value>,
+    usage: &llm::TokenUsage,
+) -> HttpResponse {
+    HttpResponse::Ok()
+        .content_type("text/event-stream")
+        .body(build_stream_body(model, output, echo, metadata, usage))
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::llm::TokenUsage;
+    use crate::responses_shape::{
+        StreamOutput, build_response, build_stream_body, calls_output, message_output,
+    };
+    use crate::responses_tools::{ModelCall, ModelTurn, ToolEcho, parse_turn};
+    use crate::responses_metadata::{METADATA_MAX_ENTRIES, METADATA_MAX_KEY_CHARS, METADATA_MAX_VALUE_CHARS};
     use clap::Parser;
 
     fn parse(json: &str) -> CreateRequest {
@@ -824,7 +513,7 @@ mod tests {
         // PH-3 replaced the PH-1 rejection of `stream: true` with SSE output.
         let request = parse(r#"{"model":"gemma3-4b","input":"hi","stream":true}"#);
         assert!(validate(&request, "gemma3-4b").is_ok());
-        assert!(!build_stream_body("gemma3-4b", "hi", None, &TokenUsage::default()).is_empty());
+        assert!(!build_stream_body("gemma3-4b", StreamOutput::Text("hi"), &ToolEcho::text_only(), None, &TokenUsage::default()).is_empty());
     }
 
     #[test]
@@ -912,9 +601,11 @@ mod tests {
 
     #[test]
     fn rejects_a_tool_request_naming_the_field() {
-        // Tool calling is PH-4 work. A request that needs it fails with a clear
-        // 400 that names the field, never a silent ignore (SP-MUST-011).
+        // A tool request that the route cannot honor fails with a clear 400
+        // that names the field, never a silent ignore (SP-MUST-011, PH4B-04).
         for (json, field) in [
+            (r#"{"input":"hi","tools":[{"type":"web_search"}]}"#, "tools"),
+            (r#"{"input":"hi","tools":[{"type":"function"}]}"#, "tools"),
             (
                 r#"{"input":"hi","tools":[{"type":"function","name":"f"}]}"#,
                 "tools",
@@ -934,6 +625,155 @@ mod tests {
     }
 
     #[test]
+    fn accepts_a_function_tool_and_echoes_the_request() {
+        // PH4B-07 (unit part): the body echoes the accepted tool request.
+        let request = parse(
+            r#"{"input":"hi","tools":[{"type":"function","name":"get_weather","description":"w","parameters":{"type":"object","properties":{"location":{"type":"string"}},"required":["location"],"additionalProperties":false},"strict":true}],"tool_choice":"auto","parallel_tool_calls":true}"#,
+        );
+        let prepared = validate(&request, "gemma3-4b").expect("valid");
+        assert!(prepared.tools.offers_tools());
+        assert!(prepared.system.contains("get_weather"));
+        let echo = ToolEcho::from_request(&prepared.tools);
+        assert!(echo.parallel_tool_calls);
+        assert_eq!(echo.tool_choice, serde_json::json!("auto"));
+        assert_eq!(echo.tools[0]["name"], "get_weather");
+        assert_eq!(echo.tools[0]["strict"], true);
+    }
+
+    #[test]
+    fn named_tool_choice_requires_a_declared_tool() {
+        // PH4B-09 (unit part).
+        let request = parse(
+            r#"{"input":"hi","tools":[{"type":"function","name":"a","parameters":{"type":"object"}}],"tool_choice":{"type":"function","name":"b"}}"#,
+        );
+        let (status, message) = validate(&request, "gemma3-4b").unwrap_err();
+        assert_eq!(status, 400);
+        assert!(message.contains("tool_choice"), "{message}");
+    }
+
+    #[test]
+    fn tools_and_structured_format_cannot_be_combined() {
+        let request = parse(
+            r#"{"input":"hi","tools":[{"type":"function","name":"a","parameters":{"type":"object"}}],"text":{"format":{"type":"json_object"}}}"#,
+        );
+        let (status, message) = validate(&request, "gemma3-4b").unwrap_err();
+        assert_eq!(status, 400);
+        assert!(message.contains("text.format"), "{message}");
+    }
+
+    #[test]
+    fn parse_turn_decodes_calls_and_messages() {
+        // PH4B-01 and PH4B-05 (unit part).
+        let request = parse(
+            r#"{"input":"hi","tools":[{"type":"function","name":"get_weather","parameters":{"type":"object","properties":{"location":{"type":"string"}},"required":["location"],"additionalProperties":false}}],"tool_choice":"auto"}"#,
+        );
+        let tools = validate(&request, "gemma3-4b").expect("valid").tools;
+        let turn = parse_turn(
+            r#"{"calls":[{"name":"get_weather","arguments":{"location":"Paris"}}]}"#,
+            &tools,
+        )
+        .expect("turn");
+        assert_eq!(
+            turn,
+            ModelTurn::Calls(vec![ModelCall {
+                name: "get_weather".to_string(),
+                arguments: r#"{"location":"Paris"}"#.to_string(),
+            }])
+        );
+        assert_eq!(
+            parse_turn(r#"{"message":"hi"}"#, &tools).expect("turn"),
+            ModelTurn::Message("hi".to_string())
+        );
+        // An undeclared name is rejected.
+        assert!(parse_turn(r#"{"calls":[{"name":"nope","arguments":{}}]}"#, &tools).is_err());
+    }
+
+    #[test]
+    fn parse_turn_enforces_the_parallel_tool_call_limit() {
+        // PH4B-05 (unit part): the route caps the call count when
+        // `parallel_tool_calls` is false and permits more than one when it is
+        // true. The envelope grammar enforces the same cap.
+        let two = r#"[{"type":"function","name":"a","parameters":{"type":"object"}},{"type":"function","name":"b","parameters":{"type":"object"}}]"#;
+        let parallel = validate(
+            &parse(&format!(
+                r#"{{"input":"hi","tools":{two},"tool_choice":"required","parallel_tool_calls":true}}"#
+            )),
+            "gemma3-4b",
+        )
+        .expect("valid")
+        .tools;
+        let calls = r#"{"calls":[{"name":"a","arguments":{}},{"name":"b","arguments":{}}]}"#;
+        match parse_turn(calls, &parallel).expect("turn") {
+            ModelTurn::Calls(calls) => assert_eq!(calls.len(), 2),
+            other => panic!("expected calls, got {other:?}"),
+        }
+
+        let serial = validate(
+            &parse(&format!(
+                r#"{{"input":"hi","tools":{two},"tool_choice":"required","parallel_tool_calls":false}}"#
+            )),
+            "gemma3-4b",
+        )
+        .expect("valid")
+        .tools;
+        assert!(parse_turn(calls, &serial).is_err());
+    }
+
+    #[test]
+    fn falls_back_to_non_strict_when_the_schema_cannot_form_a_grammar() {
+        // PH4B-06 (unit part): an omitted `strict` that cannot convert falls
+        // back to best effort, and the body echoes `strict: false`. An explicit
+        // `strict: true` instead returns a 400.
+        let lenient = parse(
+            r#"{"input":"hi","tools":[{"type":"function","name":"a","parameters":{"type":"bogus-type"}}]}"#,
+        );
+        let prepared = validate(&lenient, "gemma3-4b").expect("valid");
+        assert!(prepared.tools.offers_tools());
+        assert!(prepared.tools.grammar.is_none());
+        assert_eq!(ToolEcho::from_request(&prepared.tools).tools[0]["strict"], false);
+
+        let strict = parse(
+            r#"{"input":"hi","tools":[{"type":"function","name":"a","parameters":{"type":"bogus-type"},"strict":true}]}"#,
+        );
+        let (status, message) = validate(&strict, "gemma3-4b").unwrap_err();
+        assert_eq!(status, 400);
+        assert!(message.contains("tools"), "{message}");
+    }
+
+    #[test]
+    fn calls_output_carries_the_function_call_fields() {
+        // PH4B-01 (unit part).
+        let calls = vec![ModelCall {
+            name: "f".to_string(),
+            arguments: "{}".to_string(),
+        }];
+        let output = calls_output(&calls);
+        assert_eq!(output[0]["type"], "function_call");
+        assert!(output[0]["id"].as_str().unwrap().starts_with("fc_"));
+        assert!(output[0]["call_id"].as_str().unwrap().starts_with("call_"));
+        assert_eq!(output[0]["name"], "f");
+        assert_eq!(output[0]["arguments"], "{}");
+        assert_eq!(output[0]["status"], "completed");
+    }
+
+    #[test]
+    fn maps_function_call_and_output_input_items() {
+        // PH-4b: a client can close a tool loop by sending the call and its
+        // output back in one request. Both fold into the prompt text.
+        let input: ResponseInput = serde_json::from_str(
+            r#"[{"role":"user","content":"weather?"},
+                {"type":"function_call","id":"fc_1","call_id":"call_1","name":"get_weather","arguments":"{\"location\":\"Paris\"}","status":"completed"},
+                {"type":"function_call_output","call_id":"call_1","output":"sunny"}]"#,
+        )
+        .unwrap();
+        let (system, user) = map_input(None, &input).unwrap();
+        assert_eq!(system, "");
+        assert!(user.contains("weather?"), "{user}");
+        assert!(user.contains("get_weather"), "{user}");
+        assert!(user.contains("sunny"), "{user}");
+    }
+
+    #[test]
     fn rejects_other_unknown_fields() {
         // A field the route does not implement still fails with a 400. That
         // includes the OpenAI generation parameters, which stay rejected until
@@ -947,6 +787,73 @@ mod tests {
                 "{json}"
             );
         }
+    }
+
+    #[test]
+    fn derives_structured_format_for_json_object() {
+        // PH4A-01 (unit part): json_object requires JSON and constrains nothing.
+        let request = parse(r#"{"input":"hi","text":{"format":{"type":"json_object"}}}"#);
+        let prepared = validate(&request, "gemma3-4b").expect("valid");
+        assert!(prepared.format.json_required);
+        assert!(prepared.format.grammar.is_some());
+    }
+
+    #[test]
+    fn derives_a_grammar_for_strict_json_schema() {
+        // PH4A-02 (unit part): strict json_schema yields a grammar.
+        let request = parse(
+            r#"{"input":"hi","text":{"format":{"type":"json_schema","name":"answer","strict":true,"schema":{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}}}}"#,
+        );
+        let prepared = validate(&request, "gemma3-4b").expect("valid");
+        assert!(prepared.format.json_required);
+        assert!(prepared.format.grammar.is_some());
+    }
+
+    #[test]
+    fn rejects_unknown_text_format_type_naming_the_field() {
+        // PH4A-03.
+        let request = parse(r#"{"input":"hi","text":{"format":{"type":"bogus"}}}"#);
+        let (status, message) = validate(&request, "gemma3-4b").unwrap_err();
+        assert_eq!(status, 400);
+        assert!(message.contains("text.format.type"), "{message}");
+    }
+
+    #[test]
+    fn rejects_json_schema_without_schema_naming_the_field() {
+        // PH4A-04.
+        let request = parse(
+            r#"{"input":"hi","text":{"format":{"type":"json_schema","name":"answer"}}}"#,
+        );
+        let (status, message) = validate(&request, "gemma3-4b").unwrap_err();
+        assert_eq!(status, 400);
+        assert!(message.contains("text.format"), "{message}");
+    }
+
+    #[test]
+    fn rejects_an_unsupported_schema_naming_the_field() {
+        // PH4A-05. The pinned converter rejects an unknown `type` value.
+        let request = parse(
+            r#"{"input":"hi","text":{"format":{"type":"json_schema","name":"answer","strict":true,"schema":{"type":"bogus-type"}}}}"#,
+        );
+        let (status, message) = validate(&request, "gemma3-4b").unwrap_err();
+        assert_eq!(status, 400);
+        assert!(message.contains("text.format.schema"), "{message}");
+    }
+
+    #[test]
+    fn rejects_text_verbosity_naming_the_field() {
+        // PH4A-07.
+        let request = parse(r#"{"input":"hi","text":{"verbosity":"low"}}"#);
+        let (status, message) = validate(&request, "gemma3-4b").unwrap_err();
+        assert_eq!(status, 400);
+        assert!(message.contains("text.verbosity"), "{message}");
+    }
+
+    #[test]
+    fn rejects_json_text_that_does_not_parse() {
+        // PH4A-06 (unit part): the JSON gate rejects non-JSON text.
+        assert!(require_json("not json").is_err());
+        assert!(require_json(r#"{"a":1}"#).is_ok());
     }
 
     #[test]
@@ -965,7 +872,7 @@ mod tests {
             input_tokens: 7,
             output_tokens: 3,
         };
-        let body = build_response("gemma3-4b", "hello", None, &usage);
+        let body = build_response("gemma3-4b", message_output("hello"), &ToolEcho::text_only(), None, &usage);
         assert_eq!(body["object"], "response");
         assert_eq!(body["status"], "completed");
         assert_eq!(body["model"], "gemma3-4b");
@@ -1011,7 +918,7 @@ mod tests {
             input_tokens: 4,
             output_tokens: 2,
         };
-        let body = build_stream_body("gemma3-4b", "hello", None, &usage);
+        let body = build_stream_body("gemma3-4b", StreamOutput::Text("hello"), &ToolEcho::text_only(), None, &usage);
         let events = parse_sse(&body);
         let types: Vec<&str> = events
             .iter()
@@ -1062,7 +969,7 @@ mod tests {
             input_tokens: 1,
             output_tokens: 1,
         };
-        let body = build_stream_body("gemma3-4b", "x", Some(&metadata), &usage);
+        let body = build_stream_body("gemma3-4b", StreamOutput::Text("x"), &ToolEcho::text_only(), Some(&metadata), &usage);
         let events = parse_sse(&body);
         assert_eq!(
             events[0]["response"]["metadata"],
@@ -1082,17 +989,17 @@ mod tests {
     fn response_echoes_metadata_or_null() {
         let usage = TokenUsage::default();
         let metadata = serde_json::json!({"a": "b"});
-        let echoed = build_response("gemma3-4b", "x", Some(&metadata), &usage);
+        let echoed = build_response("gemma3-4b", message_output("x"), &ToolEcho::text_only(), Some(&metadata), &usage);
         assert_eq!(echoed["metadata"], serde_json::json!({"a": "b"}));
-        let absent = build_response("gemma3-4b", "x", None, &usage);
+        let absent = build_response("gemma3-4b", message_output("x"), &ToolEcho::text_only(), None, &usage);
         assert!(absent["metadata"].is_null());
     }
 
     #[test]
     fn response_ids_are_unique_and_prefixed() {
         let usage = TokenUsage::default();
-        let first = build_response("gemma3-4b", "a", None, &usage);
-        let second = build_response("gemma3-4b", "b", None, &usage);
+        let first = build_response("gemma3-4b", message_output("a"), &ToolEcho::text_only(), None, &usage);
+        let second = build_response("gemma3-4b", message_output("b"), &ToolEcho::text_only(), None, &usage);
         let first_id = first["id"].as_str().unwrap();
         let second_id = second["id"].as_str().unwrap();
         assert!(first_id.starts_with("resp_"));

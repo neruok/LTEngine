@@ -356,3 +356,100 @@ Limits of this record:
 
 This profile claims no full OpenAI parity (`SP-NEVER-012`). The stream claim
 covers the text scope of section 4 only.
+
+## 10. `PH-4a`: structured output
+
+The `PH-4a` change delivers `SP-PLANNED-003` (structured JSON output with
+schema validation). The OpenAI Responses API contract is the reference
+(`RD-19`). The route accepts `text.format` with the types `text`, `json_object`,
+and `json_schema`.
+
+| Field | Behavior |
+| ----- | -------- |
+| `text.format.type` | `text` (default), `json_object`, or `json_schema`. Any other value is a 400 that names `text.format.type`. |
+| `json_object` | The decode is constrained to valid JSON. `output_text` parses as a JSON value. |
+| `json_schema` | Requires `name` (1 to 64 characters of `a-z`, `A-Z`, `0-9`, `_`, `-`) and `schema` (a JSON object). |
+| `json_schema.strict: true` | The schema becomes a GBNF grammar through `llama_cpp_2::json_schema_to_grammar`, and the sampler is constrained with it. The output conforms to the schema. |
+| `json_schema.strict` omitted or `false` | Best effort. The output must still parse as JSON, and a non-conforming output is a 500. |
+| `text.verbosity` | Part of the OpenAI contract, not implemented. A present value is a 400 that names `text.verbosity`, never a silent ignore (`SP-NEVER-010`). |
+| Invalid or unsupported schema | A 400 that names `text.format` or `text.format.schema`, matching the OpenAI rejection of an unsupported schema. |
+| Non-conforming generated output | The OpenAI-shaped HTTP 500 `server_error` error. The route never returns malformed JSON as a valid `output_text`, and it makes one generation attempt (`RD-14`). |
+
+Live evidence, local fixture `http://127.0.0.1:5051/v1`, key `ph1-test-key`,
+loaded model = the full `--model-file` GGUF path:
+
+| Check | Result |
+| ----- | ------ |
+| `json_object` request | `PASS`: HTTP 200 and `output_text` parsed as a JSON object |
+| strict `json_schema` request | `PASS`: HTTP 200 and `output_text` parsed to `{"answer": "Paris"}`, which conforms to the schema |
+| Unknown `text.format.type` | `PASS`: HTTP 400 naming `text.format.type` |
+| `json_schema` without `schema` | `PASS`: HTTP 400 naming `text.format` |
+| Unsupported schema | `PASS`: HTTP 400 naming `text.format.schema` |
+| `text.verbosity` | `PASS`: HTTP 400 naming `text.verbosity` |
+| Non-strict non-conforming output | `PASS`: HTTP 500 `server_error` |
+| Unit tests | `PASS`: `CARGO_NET_OFFLINE=true cargo test` exits 0 with 32 passed and 0 failed |
+| Release build | `PASS`: `CARGO_NET_OFFLINE=true cargo build --release` exits 0 |
+| Preserved behavior | `PASS`: `bin/lt ph1` reports 60 ok of 60, so the `RD-17` stream order, the error cases, and the legacy routes are unchanged |
+
+Limits of this record:
+
+1. A `refusal` content part is not implemented. Model refusal behavior is
+   outside the permanent limits (`SP-NEVER-001`), so a local model refusal is
+   ordinary `output_text`.
+2. The route does not enforce the OpenAI strict-mode schema requirements that
+   the converter accepts, such as `additionalProperties: false` on every object.
+   The converter's rejection set is the route's unsupported-schema set.
+3. `json_schema` with `strict` omitted defaults to non-strict. The OpenAI guides
+   state no default for `text.format`.
+4. The SDK smoke tests of section 3 do not cover `SP-PLANNED-003` yet.
+
+`SP-PLANNED-004` and `SP-PLANNED-005` stay with `PH-4b` and are not delivered.
+This profile still claims no full OpenAI parity (`SP-NEVER-012`).
+
+## 11. `PH-4b`: function calling
+
+The `PH-4b` change delivers `SP-PLANNED-004` (custom function calling) and
+`SP-PLANNED-005` (`tool_choice` and parallel calls). The OpenAI Responses API
+tool contract is the reference (`RD-20`).
+
+| Field | Behavior |
+| ----- | -------- |
+| `tools` | A `function` tool is `{type, name, parameters, description?, strict?}`. A tool whose `type` is not `function` is a 400 that names `tools`. |
+| `strict: true` | The tool `arguments` are constrained to the tool `parameters` schema. |
+| `strict` omitted | The route attempts strict normalization and falls back to non-strict. The body echoes the effective `strict` value. |
+| `strict: false` | Best effort; the body echoes `strict: false`. |
+| `tool_choice` | `none`, `auto`, `required`, or `{type:"function", name}`. `required` needs at least one tool. A named function must be declared, or the route returns a 400 that names `tool_choice`. |
+| `parallel_tool_calls` | `true` permits several `function_call` items; `false` permits at most one. |
+| Output | One or more `function_call` items: `type`, `id` (`fc_*`), `call_id` (`call_*`), `name`, `arguments` (a JSON string), `status`. |
+| `input` items | `function_call` and `function_call_output` are accepted so a client can close a tool loop in one request. |
+| Stream | `response.output_item.added`, zero or more `response.function_call_arguments.delta`, `response.function_call_arguments.done`, `response.output_item.done`, inside the `RD-17` lifecycle. |
+| Execution | The route executes no tool and calls no upstream service (`SP-NEVER-009`). The client executes the call. |
+
+Live evidence, local fixture `http://127.0.0.1:5051/v1`, key `ph1-test-key`,
+loaded model = the full `--model-file` GGUF path:
+
+| Check | Result |
+| ----- | ------ |
+| `tool_choice: auto` with a `get_weather` tool | `PASS`: HTTP 200 and one `function_call` item with `fc_*` id, `call_*` call_id, `name` `get_weather`, and `arguments` `{"location":"Paris"}` |
+| `tool_choice: required` | `PASS`: at least one `function_call` item |
+| `tool_choice: {type:"function", name}` | `PASS`: the named function call |
+| Tool `type` `web_search` | `PASS`: HTTP 400 naming `tools` |
+| Named function that is not declared | `PASS`: HTTP 400 naming `tool_choice` |
+| `stream: true` tool request | `PASS`: `text/event-stream` with the tool order, `sequence_number` from 0, and an added item with empty `arguments` |
+| Tool loop with `function_call` and `function_call_output` input | `PASS`: HTTP 200 and a message that used the tool result |
+| Unit tests | `PASS`: `CARGO_NET_OFFLINE=true cargo test` exits 0 with 40 passed and 0 failed |
+| Release build | `PASS`: `CARGO_NET_OFFLINE=true cargo build --release` exits 0 |
+| Preserved behavior | `PASS`: `bin/lt ph1` reports 60 ok of 60 |
+
+Limits of this record:
+
+1. A request that combines `tools` with a structured `text.format` is rejected
+   with a 400 that names `text.format`. The two grammars are not merged.
+2. `parallel_tool_calls: true` permits several calls; whether the model emits
+   more than one depends on the model and the prompt.
+3. The transcription envelope is LTEngine-defined: `{"message": "..."}` or
+   `{"calls": [...]}`. It is not an OpenAI wire format, and the model must be
+   able to follow it.
+
+`SP-PLANNED-003` is delivered by `PH-4a` (section 10). This profile still claims
+no full OpenAI parity (`SP-NEVER-012`).

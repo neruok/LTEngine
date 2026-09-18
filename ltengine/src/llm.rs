@@ -291,16 +291,24 @@ impl LLM {
     /// [`LLM::run_prompt_usage`], so every caller uses one decode path
     /// (`CC-4`).
     pub fn run_prompt(&self, system: String, user: String) -> Result<String>{
-        self.run_prompt_usage(system, user, &Reasoning::default())
-            .map(|(text, _usage)| text)
+        self.run_prompt_usage(system, user).map(|(text, _usage)| text)
     }
 
     /// Run one generation and return the cleaned text with the exact token
     /// counts of RD-18, under explicit reasoning controls (`RD-28`).
-    pub fn run_prompt_usage(
+    pub fn run_prompt_usage(&self, system: String, user: String) -> Result<(String, TokenUsage)>{
+        self.run_prompt_usage_grammar(system, user, None, &Reasoning::default())
+    }
+
+    /// Run one generation with an optional GBNF grammar that constrains decode
+    /// (PH-4a). `None` keeps the free-text behavior of [`LLM::run_prompt_usage`].
+    /// The grammar is the only difference: both callers share one decode path
+    /// (`CC-4`).
+    pub fn run_prompt_usage_grammar(
         &self,
         system: String,
         user: String,
+        grammar: Option<&str>,
         reasoning: &Reasoning<'_>,
     ) -> Result<(String, TokenUsage)>{
         let messages = [
@@ -345,10 +353,10 @@ impl LLM {
         let _lock = self.prompt_lock.try_lock_for(Duration::from_secs(120))
             .ok_or(LLMError::Busy)?;
         let (text, output_tokens) = if self.mtp_model.is_some() || self.self_mtp {
-            self.process_mtp(tokens_list, ctx_size)?
+            self.process_mtp(tokens_list, ctx_size, grammar)?
         } else {
             let mut ctx = self.create_context(ctx_size)?;
-            ctx.process(tokens_list)?
+            ctx.process(tokens_list, grammar)?
         };
         Ok((text, TokenUsage { input_tokens, output_tokens }))
     }
@@ -357,6 +365,7 @@ impl LLM {
         &self,
         tokens_list: Vec<LlamaToken>,
         output_limit: i32,
+        grammar: Option<&str>,
     ) -> Result<(String, u32)> {
         // The draft model is the separate `--mtp-model-file` model when present,
         // and otherwise the target model's own nextn/MTP head.
@@ -400,9 +409,10 @@ impl LLM {
         mtp.process(&batch).context("MTP draft prefill failed")?;
         mtp.begin(&tokens_list).context("MTP generation setup failed")?;
 
-        let mut sampler = create_sampler(&self.model);
+        let mut sampler = create_sampler(&self.model, grammar)?;
+        // `LlamaSampler::sample` accepts the sampled token inside llama.cpp;
+        // the loop must not accept it again (PH-4a).
         let mut token = sampler.sample(mtp.target_context(), batch.n_tokens() - 1);
-        sampler.accept(token);
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let mut output = String::new();
         let mut n_past = batch.n_tokens();
@@ -444,7 +454,6 @@ impl LLM {
 
             let mut accepted = 0_usize;
             let mut next = sampler.sample(mtp.target_context(), 0);
-            sampler.accept(next);
             for (i, draft_token) in drafts.iter().copied().enumerate() {
                 if next != draft_token {
                     break;
@@ -454,7 +463,6 @@ impl LLM {
                     break;
                 }
                 next = sampler.sample(mtp.target_context(), i32::try_from(i + 1)?);
-                sampler.accept(next);
             }
 
             let new_n_past = n_past + 1 + i32::try_from(accepted)?;
@@ -574,9 +582,15 @@ fn probe_mtp(
     Ok(())
 }
 
-fn create_sampler(model: &LlamaModel) -> LlamaSampler {
+/// Build the sampler chain. `grammar` prepends a GBNF grammar sampler so every
+/// sampled token follows the grammar (PH-4a, RD-19).
+fn create_sampler(model: &LlamaModel, grammar: Option<&str>) -> Result<LlamaSampler> {
     let seq_breakers = vec![b"\n", b":", b"\"", b"*"];
-    LlamaSampler::chain_simple([
+    let mut samplers = Vec::with_capacity(10);
+    if let Some(grammar) = grammar {
+        samplers.push(LlamaSampler::grammar(model, grammar, "root")?);
+    }
+    samplers.extend([
         LlamaSampler::penalties(model.n_vocab(), 64, 1.0, 0.0, 0.0),
         LlamaSampler::dry(model, 0.0, 1.75, 2, -1, seq_breakers),
         LlamaSampler::top_k(40),
@@ -586,7 +600,8 @@ fn create_sampler(model: &LlamaModel) -> LlamaSampler {
         LlamaSampler::xtc(0.0, 0.1, 0, 42),
         LlamaSampler::temp_ext(0.0, 0.0, 1.0),
         LlamaSampler::dist(42),
-    ])
+    ]);
+    Ok(LlamaSampler::chain_simple(samplers))
 }
 
 fn append_token(
@@ -686,8 +701,9 @@ fn validate_mtp_n_max(value: i32) -> Result<()> {
 
 impl LLMContext<'_>{
     /// Decode a prompt and return the cleaned text with the number of generated
-    /// token IDs, excluding the end-of-generation token (RD-18).
-    pub fn process(&mut self, tokens_list: Vec<LlamaToken>) -> Result<(String, u32)>{
+    /// token IDs, excluding the end-of-generation token (RD-18). `grammar`
+    /// constrains the decode when present (PH-4a).
+    pub fn process(&mut self, tokens_list: Vec<LlamaToken>, grammar: Option<&str>) -> Result<(String, u32)>{
         // let ctx_size: i32 = tokens_list.len() as i32 * 3;
         
         // We use this object to submit token data for decoding
@@ -706,7 +722,7 @@ impl LLMContext<'_>{
         let mut n_cur = batch.n_tokens();
 
         let mut decoder = encoding_rs::UTF_8.new_decoder();
-        let mut sampler = create_sampler(&self.llm.model);
+        let mut sampler = create_sampler(&self.llm.model, grammar)?;
 
         let mut output = String::new();
         let mut usage = TokenUsage::default();
@@ -717,8 +733,9 @@ impl LLMContext<'_>{
             {
                 let token = sampler.sample(&self.ctx, batch.n_tokens() - 1);
 
-                sampler.accept(token);
-
+                // `llama_sampler_sample` accepts the token inside llama.cpp,
+                // so the loop must not accept it a second time. A second accept
+                // advances a grammar past its end and exhausts it (PH-4a).
                 // is it an end of stream?
                 if self.llm.model.is_eog_token(token) {
                     break;
