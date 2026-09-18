@@ -62,17 +62,25 @@ pub(crate) fn bearer(req: &HttpRequest) -> Option<&str> {
         .and_then(|value| value.to_str().ok())
 }
 
+/// The query fields of a request, as `(name, value)` pairs. A field without a
+/// value has `None`.
+pub(crate) fn query_fields(req: &HttpRequest) -> Vec<(String, Option<String>)> {
+    req.query_string()
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| match pair.split_once('=') {
+            Some((name, value)) => (name.to_string(), Some(value.to_string())),
+            None => (pair.to_string(), None),
+        })
+        .collect()
+}
+
 /// The name of the first unsupported query field, or `None` when the query is
 /// empty (`CC-6`). `PH-5` supports no query field on retrieval, so any field
-/// takes this path, including `stream=true`.
+/// takes this path. `PH-5a` replaces this use for the `GET` route with
+/// `query_fields`.
 pub(crate) fn first_query_field(req: &HttpRequest) -> Option<String> {
-    let query = req.query_string();
-    if query.is_empty() {
-        return None;
-    }
-    let field = query.split('&').next().unwrap_or(query);
-    let name = field.split('=').next().unwrap_or(field);
-    Some(name.to_string())
+    query_fields(req).into_iter().next().map(|(name, _)| name)
 }
 
 #[cfg(test)]

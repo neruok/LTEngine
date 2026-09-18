@@ -162,21 +162,204 @@ pub(crate) enum StreamOutput<'a> {
     Calls(&'a [ModelCall]),
 }
 
-/// Append one SSE frame. The frame carries the OpenAI event name line and the
-/// JSON payload line. The payload carries its event `type` and the next
-/// `sequence_number` (RD-17).
-fn push_event(body: &mut String, sequence: &mut u32, event_type: &str, mut payload: Value) {
+/// Append one SSE event to the ordered event list. The payload carries its
+/// event `type` and the next `sequence_number` (RD-17).
+fn push_event(
+    events: &mut Vec<(String, Value)>,
+    sequence: &mut u32,
+    event_type: &str,
+    mut payload: Value,
+) {
     let map = payload
         .as_object_mut()
         .expect("an event payload is a JSON object");
     map.insert("type".to_string(), Value::from(event_type));
     map.insert("sequence_number".to_string(), Value::from(*sequence));
     *sequence += 1;
-    body.push_str("event: ");
-    body.push_str(event_type);
-    body.push_str("\ndata: ");
-    body.push_str(&payload.to_string());
-    body.push_str("\n\n");
+    events.push((event_type.to_string(), payload));
+}
+
+/// The final output items of a streamed turn. The identifiers are created once,
+/// so the per-item events and the completed body carry the same ones.
+fn stream_items(output: StreamOutput<'_>) -> Vec<Value> {
+    match output {
+        StreamOutput::Text(text) => vec![message_item(&new_id("msg_"), "completed", Some(text))],
+        StreamOutput::Calls(calls) => calls
+            .iter()
+            .map(|call| {
+                function_call_item(
+                    &new_id("fc_"),
+                    &new_id("call_"),
+                    &call.name,
+                    &call.arguments,
+                    "completed",
+                )
+            })
+            .collect(),
+    }
+}
+
+/// The ordered `RD-17` event list of one response.
+///
+/// `in_progress` and `completed` are the two response objects that the stream
+/// carries. `items` are the final output items. The per-item events derive from
+/// `items`, so the list is the same whether the response was streamed at create
+/// time or replayed later (`PH-5a`).
+fn build_events(in_progress: Value, completed: Value, items: &[Value]) -> Vec<(String, Value)> {
+    let mut sequence = 0_u32;
+    let mut events: Vec<(String, Value)> = Vec::new();
+    push_event(
+        &mut events,
+        &mut sequence,
+        "response.created",
+        json!({"response": in_progress.clone()}),
+    );
+    push_event(
+        &mut events,
+        &mut sequence,
+        "response.in_progress",
+        json!({"response": in_progress}),
+    );
+
+    for (output_index, item) in items.iter().enumerate() {
+        match item["type"].as_str() {
+            Some("message") => {
+                let item_id = item["id"].as_str().unwrap_or_default().to_string();
+                let text = item["content"][0]["text"].as_str().unwrap_or_default();
+                push_event(
+                    &mut events,
+                    &mut sequence,
+                    "response.output_item.added",
+                    json!({
+                        "output_index": output_index,
+                        "item": message_item(&item_id, "in_progress", None),
+                    }),
+                );
+                push_event(
+                    &mut events,
+                    &mut sequence,
+                    "response.content_part.added",
+                    json!({
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "part": output_text_part(""),
+                    }),
+                );
+                push_event(
+                    &mut events,
+                    &mut sequence,
+                    "response.output_text.delta",
+                    json!({
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "delta": text,
+                        "logprobs": [],
+                    }),
+                );
+                push_event(
+                    &mut events,
+                    &mut sequence,
+                    "response.output_text.done",
+                    json!({
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "text": text,
+                    }),
+                );
+                push_event(
+                    &mut events,
+                    &mut sequence,
+                    "response.content_part.done",
+                    json!({
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "part": output_text_part(text),
+                    }),
+                );
+                push_event(
+                    &mut events,
+                    &mut sequence,
+                    "response.output_item.done",
+                    json!({"output_index": output_index, "item": item}),
+                );
+            }
+            Some("function_call") => {
+                let item_id = item["id"].as_str().unwrap_or_default().to_string();
+                let call_id = item["call_id"].as_str().unwrap_or_default();
+                let name = item["name"].as_str().unwrap_or_default();
+                let arguments = item["arguments"].as_str().unwrap_or_default();
+                push_event(
+                    &mut events,
+                    &mut sequence,
+                    "response.output_item.added",
+                    json!({
+                        "output_index": output_index,
+                        "item": function_call_item(&item_id, call_id, name, "", "in_progress"),
+                    }),
+                );
+                push_event(
+                    &mut events,
+                    &mut sequence,
+                    "response.function_call_arguments.delta",
+                    json!({
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "delta": arguments,
+                    }),
+                );
+                push_event(
+                    &mut events,
+                    &mut sequence,
+                    "response.function_call_arguments.done",
+                    json!({
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "arguments": arguments,
+                    }),
+                );
+                push_event(
+                    &mut events,
+                    &mut sequence,
+                    "response.output_item.done",
+                    json!({"output_index": output_index, "item": item}),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    push_event(
+        &mut events,
+        &mut sequence,
+        "response.completed",
+        json!({"response": completed}),
+    );
+    events
+}
+
+/// Render an event list as the SSE body. `starting_after` keeps the original
+/// `sequence_number` values and drops only the events up to and including it
+/// (`RD-27`).
+fn render_events(events: &[(String, Value)], starting_after: Option<u32>) -> String {
+    let mut body = String::new();
+    for (event_type, payload) in events {
+        if let Some(start) = starting_after {
+            let sequence = payload["sequence_number"].as_u64().unwrap_or(u64::MAX);
+            if sequence <= u64::from(start) {
+                continue;
+            }
+        }
+        body.push_str("event: ");
+        body.push_str(event_type);
+        body.push_str("\ndata: ");
+        body.push_str(&payload.to_string());
+        body.push_str("\n\n");
+    }
+    body
 }
 
 /// Build the SSE body of a successful `stream: true` request (RD-17, RD-20).
@@ -212,23 +395,7 @@ pub(crate) fn build_stream_body(
 ) -> (String, Value) {
     let response_id = new_id("resp_");
     let created_at = now_secs();
-    // Build the final items once so the per-item events and the completed body
-    // carry the same identifiers.
-    let items: Vec<Value> = match output {
-        StreamOutput::Text(text) => vec![message_item(&new_id("msg_"), "completed", Some(text))],
-        StreamOutput::Calls(calls) => calls
-            .iter()
-            .map(|call| {
-                function_call_item(
-                    &new_id("fc_"),
-                    &new_id("call_"),
-                    &call.name,
-                    &call.arguments,
-                    "completed",
-                )
-            })
-            .collect(),
-    };
+    let items = stream_items(output);
     let in_progress = response_object(
         &response_id,
         created_at,
@@ -249,138 +416,26 @@ pub(crate) fn build_stream_body(
         Value::Array(items.clone()),
         usage_json(usage),
     );
+    let events = build_events(in_progress, completed.clone(), &items);
+    (render_events(&events, None), completed)
+}
 
-    let mut sequence = 0_u32;
-    let mut body = String::new();
-    push_event(
-        &mut body,
-        &mut sequence,
-        "response.created",
-        json!({"response": in_progress}),
-    );
-    push_event(
-        &mut body,
-        &mut sequence,
-        "response.in_progress",
-        json!({"response": in_progress}),
-    );
-
-    for (output_index, item) in items.iter().enumerate() {
-        match item["type"].as_str() {
-            Some("message") => {
-                let item_id = item["id"].as_str().unwrap_or_default().to_string();
-                let text = item["content"][0]["text"].as_str().unwrap_or_default();
-                push_event(
-                    &mut body,
-                    &mut sequence,
-                    "response.output_item.added",
-                    json!({
-                        "output_index": output_index,
-                        "item": message_item(&item_id, "in_progress", None),
-                    }),
-                );
-                push_event(
-                    &mut body,
-                    &mut sequence,
-                    "response.content_part.added",
-                    json!({
-                        "item_id": item_id,
-                        "output_index": output_index,
-                        "content_index": 0,
-                        "part": output_text_part(""),
-                    }),
-                );
-                push_event(
-                    &mut body,
-                    &mut sequence,
-                    "response.output_text.delta",
-                    json!({
-                        "item_id": item_id,
-                        "output_index": output_index,
-                        "content_index": 0,
-                        "delta": text,
-                        "logprobs": [],
-                    }),
-                );
-                push_event(
-                    &mut body,
-                    &mut sequence,
-                    "response.output_text.done",
-                    json!({
-                        "item_id": item_id,
-                        "output_index": output_index,
-                        "content_index": 0,
-                        "text": text,
-                    }),
-                );
-                push_event(
-                    &mut body,
-                    &mut sequence,
-                    "response.content_part.done",
-                    json!({
-                        "item_id": item_id,
-                        "output_index": output_index,
-                        "content_index": 0,
-                        "part": output_text_part(text),
-                    }),
-                );
-                push_event(
-                    &mut body,
-                    &mut sequence,
-                    "response.output_item.done",
-                    json!({"output_index": output_index, "item": item}),
-                );
-            }
-            Some("function_call") => {
-                let item_id = item["id"].as_str().unwrap_or_default().to_string();
-                let call_id = item["call_id"].as_str().unwrap_or_default();
-                let name = item["name"].as_str().unwrap_or_default();
-                let arguments = item["arguments"].as_str().unwrap_or_default();
-                push_event(
-                    &mut body,
-                    &mut sequence,
-                    "response.output_item.added",
-                    json!({
-                        "output_index": output_index,
-                        "item": function_call_item(&item_id, call_id, name, "", "in_progress"),
-                    }),
-                );
-                push_event(
-                    &mut body,
-                    &mut sequence,
-                    "response.function_call_arguments.delta",
-                    json!({
-                        "item_id": item_id,
-                        "output_index": output_index,
-                        "delta": arguments,
-                    }),
-                );
-                push_event(
-                    &mut body,
-                    &mut sequence,
-                    "response.function_call_arguments.done",
-                    json!({
-                        "item_id": item_id,
-                        "output_index": output_index,
-                        "arguments": arguments,
-                    }),
-                );
-                push_event(
-                    &mut body,
-                    &mut sequence,
-                    "response.output_item.done",
-                    json!({"output_index": output_index, "item": item}),
-                );
-            }
-            _ => {}
-        }
+/// Replay the SSE sequence of a stored response (`PH-5a`, `RD-27`).
+///
+/// Regenerates the event list from the stored response object. It calls no
+/// model and reruns no generation. `starting_after` filters by
+/// `sequence_number`. Returns `None` when the stored object cannot be replayed,
+/// because its `id`, `created_at`, or `output` is missing.
+pub(crate) fn replay_stream_body(response: &Value, starting_after: Option<u32>) -> Option<String> {
+    let items = response["output"].as_array()?.clone();
+    response["id"].as_str()?;
+    response["created_at"].as_u64()?;
+    let mut in_progress = response.clone();
+    if let Some(map) = in_progress.as_object_mut() {
+        map.insert("status".to_string(), Value::from("in_progress"));
+        map.insert("output".to_string(), json!([]));
+        map.insert("usage".to_string(), Value::Null);
     }
-
-    push_event(
-        &mut body,
-        &mut sequence,
-        "response.completed",
-        json!({"response": completed.clone()}),
-    );
-    (body, completed)
+    let events = build_events(in_progress, response.clone(), &items);
+    Some(render_events(&events, starting_after))
 }

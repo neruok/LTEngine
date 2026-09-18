@@ -11,7 +11,9 @@ use actix_web::{HttpRequest, HttpResponse, delete, get, web};
 use serde_json::Value;
 
 use crate::Args;
-use crate::responses_http::{bearer, check_auth, error_json, first_query_field, not_found};
+use crate::responses_http::{
+    bearer, check_auth, error_json, first_query_field, not_found, query_fields,
+};
 use crate::responses_store::AppStore;
 
 /// The credential check and the query guard shared by the retrieval routes.
@@ -34,7 +36,65 @@ fn guard(req: &HttpRequest, args: &Args) -> Option<HttpResponse> {
     None
 }
 
-/// `GET /v1/responses/{response_id}` (SP-PLANNED-008).
+/// The supported query of retrieval (`RD-27`).
+struct RetrieveQuery {
+    stream: bool,
+    starting_after: Option<u32>,
+}
+
+/// Parse the retrieval query (`RD-27`, `CC-6`).
+///
+/// `stream` accepts `true` and `false`. `starting_after` is a non-negative
+/// integer and requires `stream=true`. Any other field, and any other value of a
+/// supported field, is a clear 400 that names the field.
+fn parse_retrieve_query(req: &HttpRequest) -> Result<RetrieveQuery, HttpResponse> {
+    let mut query = RetrieveQuery {
+        stream: false,
+        starting_after: None,
+    };
+    for (name, value) in query_fields(req) {
+        match name.as_str() {
+            "stream" => match value.as_deref() {
+                Some("true") => query.stream = true,
+                Some("false") => query.stream = false,
+                _ => {
+                    return Err(error_json(
+                        400,
+                        "`stream` must be `true` or `false`".to_string(),
+                    ));
+                }
+            },
+            "starting_after" => {
+                match value.as_deref().and_then(|value| value.parse::<u32>().ok()) {
+                    Some(after) => query.starting_after = Some(after),
+                    None => {
+                        return Err(error_json(
+                            400,
+                            "`starting_after` must be a non-negative integer".to_string(),
+                        ));
+                    }
+                }
+            }
+            other => {
+                return Err(error_json(
+                    400,
+                    format!("unsupported query field `{other}` on this route"),
+                ));
+            }
+        }
+    }
+    if query.starting_after.is_some() && !query.stream {
+        return Err(error_json(
+            400,
+            "`starting_after` requires `stream=true`".to_string(),
+        ));
+    }
+    Ok(query)
+}
+
+/// `GET /v1/responses/{response_id}` (SP-PLANNED-008). With `stream=true` it
+/// replays the stored SSE sequence (`PH-5a`, `RD-27`); otherwise it returns the
+/// stored JSON body.
 #[get("/v1/responses/{response_id}")]
 pub async fn get_response(
     req: HttpRequest,
@@ -42,12 +102,33 @@ pub async fn get_response(
     args: web::Data<Arc<Args>>,
     store: web::Data<AppStore>,
 ) -> HttpResponse {
-    if let Some(response) = guard(&req, &args) {
-        return response;
+    if let Err(message) = check_auth(&args.api_key, bearer(&req)) {
+        return error_json(401, message);
     }
+    let query = match parse_retrieve_query(&req) {
+        Ok(query) => query,
+        Err(response) => return response,
+    };
     let id = path.into_inner();
     match store.get_ref().get(&id) {
-        Ok(Some(record)) => HttpResponse::Ok().json(record.response),
+        Ok(Some(record)) => {
+            if query.stream {
+                match crate::responses_shape::replay_stream_body(
+                    &record.response,
+                    query.starting_after,
+                ) {
+                    Some(body) => HttpResponse::Ok()
+                        .content_type("text/event-stream")
+                        .body(body),
+                    None => error_json(
+                        500,
+                        "the stored response cannot be replayed".to_string(),
+                    ),
+                }
+            } else {
+                HttpResponse::Ok().json(record.response)
+            }
+        }
         Ok(None) => not_found(&id),
         Err(err) => error_json(500, format!("failed to read the response store: {err}")),
     }
@@ -121,13 +202,27 @@ mod tests {
     use actix_web::{App, test};
     use clap::Parser;
 
+    /// A stored record whose response object is replayable (`RD-27`).
     fn record() -> StoredResponse {
         StoredResponse {
             response: serde_json::json!({
                 "id": "resp_1",
                 "object": "response",
+                "created_at": 1,
                 "status": "completed",
-                "output": [{"type": "message"}],
+                "model": "gemma3-4b",
+                "metadata": null,
+                "parallel_tool_calls": false,
+                "tool_choice": "none",
+                "tools": [],
+                "output": [{
+                    "id": "msg_out_1",
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "hello", "annotations": []}],
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
             }),
             input_items: vec![
                 serde_json::json!({"id": "msg_1", "role": "user", "content": "first"}),
@@ -275,15 +370,14 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn query_field_is_a_400() {
-        // PH5-11.
+    async fn unsupported_query_field_is_400() {
+        // PH5A-06: a field other than `stream` and `starting_after` is a 400.
         let temp = TempStoreDir::new();
         let store: AppStore = Arc::new(store_with(&temp.path));
         store.put("resp_1", &record()).expect("put");
         let app = service!(store, "secret");
 
         for (uri, field) in [
-            ("/v1/responses/resp_1?stream=true", "stream"),
             ("/v1/responses/resp_1?include=x", "include"),
             ("/v1/responses/resp_1/input_items?limit=1", "limit"),
         ] {
@@ -338,5 +432,178 @@ mod tests {
             .to_request();
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), actix_web::http::StatusCode::NOT_FOUND);
+    }
+
+    /// Parse an SSE body into its JSON payloads.
+    fn parse_sse(body: &str) -> Vec<Value> {
+        body.split("\n\n")
+            .filter(|frame| !frame.trim().is_empty())
+            .map(|frame| {
+                let data = frame
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data: "))
+                    .expect("frame has a data line");
+                serde_json::from_str(data).expect("payload is JSON")
+            })
+            .collect()
+    }
+
+    /// A `GET` that returns the status, the content type, and the raw body.
+    async fn get_raw(
+        store: AppStore,
+        uri: &str,
+    ) -> (actix_web::http::StatusCode, String, String) {
+        let app = service!(store, "secret");
+        let req = test::TestRequest::get()
+            .uri(uri)
+            .insert_header(bearer("secret"))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(actix_web::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let body = test::read_body(resp).await;
+        (status, content_type, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    #[actix_web::test]
+    async fn stream_true_returns_sse() {
+        // PH5A-01 (route part).
+        let temp = TempStoreDir::new();
+        let store: AppStore = Arc::new(store_with(&temp.path));
+        store.put("resp_1", &record()).expect("put");
+        let (status, content_type, body) =
+            get_raw(store, "/v1/responses/resp_1?stream=true").await;
+        assert_eq!(status, actix_web::http::StatusCode::OK);
+        assert!(content_type.starts_with("text/event-stream"), "{content_type}");
+        let events = parse_sse(&body);
+        let types: Vec<&str> = events
+            .iter()
+            .map(|event| event["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            types,
+            [
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+        for (index, event) in events.iter().enumerate() {
+            assert_eq!(event["sequence_number"], index);
+        }
+        assert_eq!(events[8]["response"], record().response);
+    }
+
+    #[actix_web::test]
+    async fn starting_after_filters() {
+        // PH5A-02 (route part): only the events after the given number remain,
+        // with their original sequence numbers.
+        let temp = TempStoreDir::new();
+        let store: AppStore = Arc::new(store_with(&temp.path));
+        store.put("resp_1", &record()).expect("put");
+        let (_, _, full) = get_raw(store.clone(), "/v1/responses/resp_1?stream=true").await;
+        let (_, _, tail) = get_raw(
+            store,
+            "/v1/responses/resp_1?stream=true&starting_after=2",
+        )
+        .await;
+        let full_events = parse_sse(&full);
+        let tail_events = parse_sse(&tail);
+        assert_eq!(tail_events, full_events[3..]);
+        assert_eq!(tail_events[0]["sequence_number"], 3);
+    }
+
+    #[actix_web::test]
+    async fn stream_false_returns_json() {
+        // PH5A-03.
+        let temp = TempStoreDir::new();
+        let store: AppStore = Arc::new(store_with(&temp.path));
+        store.put("resp_1", &record()).expect("put");
+        let app = service!(store, "secret");
+        for uri in ["/v1/responses/resp_1", "/v1/responses/resp_1?stream=false"] {
+            let req = test::TestRequest::get()
+                .uri(uri)
+                .insert_header(bearer("secret"))
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+            assert_eq!(resp.status(), actix_web::http::StatusCode::OK, "{uri}");
+            let body: Value = test::read_body_json(resp).await;
+            assert_eq!(body, record().response, "{uri}");
+        }
+    }
+
+    #[actix_web::test]
+    async fn bad_stream_value_is_400() {
+        // PH5A-04.
+        let temp = TempStoreDir::new();
+        let store: AppStore = Arc::new(store_with(&temp.path));
+        store.put("resp_1", &record()).expect("put");
+        let app = service!(store, "secret");
+        let req = test::TestRequest::get()
+            .uri("/v1/responses/resp_1?stream=maybe")
+            .insert_header(bearer("secret"))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::BAD_REQUEST);
+        let body: Value = test::read_body_json(resp).await;
+        assert!(body["error"]["message"].as_str().unwrap().contains("stream"));
+    }
+
+    #[actix_web::test]
+    async fn starting_after_requires_stream() {
+        // PH5A-05.
+        let temp = TempStoreDir::new();
+        let store: AppStore = Arc::new(store_with(&temp.path));
+        store.put("resp_1", &record()).expect("put");
+        let app = service!(store, "secret");
+        for uri in [
+            "/v1/responses/resp_1?starting_after=2",
+            "/v1/responses/resp_1?stream=true&starting_after=abc",
+        ] {
+            let req = test::TestRequest::get()
+                .uri(uri)
+                .insert_header(bearer("secret"))
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+            assert_eq!(resp.status(), actix_web::http::StatusCode::BAD_REQUEST, "{uri}");
+            let body: Value = test::read_body_json(resp).await;
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("starting_after"),
+                "{uri} -> {body}"
+            );
+        }
+    }
+
+    #[actix_web::test]
+    async fn unknown_stream_is_404() {
+        // PH5A-07.
+        let temp = TempStoreDir::new();
+        let store: AppStore = Arc::new(store_with(&temp.path));
+        let app = service!(store, "secret");
+        let req = test::TestRequest::get()
+            .uri("/v1/responses/resp_missing?stream=true")
+            .insert_header(bearer("secret"))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::NOT_FOUND);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(
+            body["error"]["message"],
+            "No response found with id 'resp_missing'"
+        );
     }
 }

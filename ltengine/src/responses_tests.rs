@@ -5,6 +5,7 @@ use super::*;
 use crate::llm::TokenUsage;
 use crate::responses_shape::{
     StreamOutput, build_response, build_stream_body, calls_output, message_output,
+    replay_stream_body,
 };
 use crate::responses_store::{
     FailingStore, FileStore, ResponseStore, StoredResponse, tests::TempStoreDir,
@@ -738,4 +739,88 @@ fn store_flag_controls_persistence() {
     maybe_store(&store, false, serde_json::json!({"id": "resp_bbbb"}), Vec::new())
         .expect("skip");
     assert!(store.get("resp_bbbb").expect("get").is_none());
+}
+
+#[test]
+fn replay_matches_the_create_stream() {
+    // PH5A-01: replay regenerates the same event list, for a message and for a
+    // function call.
+    let usage = TokenUsage {
+        input_tokens: 4,
+        output_tokens: 2,
+    };
+    let (body, completed) = build_stream_body(
+        "gemma3-4b",
+        StreamOutput::Text("hello"),
+        &ToolEcho::text_only(),
+        None,
+        &usage,
+    );
+    let replay = replay_stream_body(&completed, None).expect("replay");
+    assert_eq!(parse_sse(&replay), parse_sse(&body));
+
+    let calls = vec![ModelCall {
+        name: "f".to_string(),
+        arguments: "{}".to_string(),
+    }];
+    let (call_body, call_completed) = build_stream_body(
+        "gemma3-4b",
+        StreamOutput::Calls(&calls),
+        &ToolEcho::text_only(),
+        None,
+        &usage,
+    );
+    let replay = replay_stream_body(&call_completed, None).expect("replay");
+    assert_eq!(parse_sse(&replay), parse_sse(&call_body));
+}
+
+#[test]
+fn replay_starting_after_filters() {
+    // PH5A-02 (unit part): the original sequence numbers are kept.
+    let usage = TokenUsage::default();
+    let (_, completed) = build_stream_body(
+        "gemma3-4b",
+        StreamOutput::Text("hello"),
+        &ToolEcho::text_only(),
+        None,
+        &usage,
+    );
+    let full = parse_sse(&replay_stream_body(&completed, None).expect("replay"));
+    let tail = parse_sse(&replay_stream_body(&completed, Some(4)).expect("replay"));
+    assert_eq!(tail, full[5..]);
+    assert_eq!(tail[0]["sequence_number"], 5);
+}
+
+#[test]
+fn replay_of_a_non_stream_response() {
+    // PH5A-01: a response created without `stream` replays too.
+    let usage = TokenUsage::default();
+    let completed = build_response(
+        "gemma3-4b",
+        message_output("hello"),
+        &ToolEcho::text_only(),
+        None,
+        &usage,
+    );
+    let events = parse_sse(&replay_stream_body(&completed, None).expect("replay"));
+    assert_eq!(events.len(), 9);
+    assert_eq!(events[8]["response"], completed);
+}
+
+#[test]
+fn replay_is_deterministic() {
+    // PH5A-08: replay is a pure function of the stored record.
+    let usage = TokenUsage::default();
+    let (_, completed) = build_stream_body(
+        "gemma3-4b",
+        StreamOutput::Text("hello"),
+        &ToolEcho::text_only(),
+        None,
+        &usage,
+    );
+    let before = completed.clone();
+    let first = replay_stream_body(&completed, None).expect("replay");
+    let second = replay_stream_body(&completed, None).expect("replay");
+    assert_eq!(first, second);
+    assert_eq!(completed, before);
 }
