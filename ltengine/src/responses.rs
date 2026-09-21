@@ -29,6 +29,7 @@ use crate::responses_input::{
     ResponseInput, input_items, map_input, output_items_as_input, parse_input_items,
     stored_items_as_input,
 };
+use crate::responses_reasoning::{ReasoningEffect, ResponseReasoning, derive_reasoning};
 use crate::responses_schema::{derive_format, ResponseTextConfig, StructuredFormat};
 use crate::responses_shape::{
     StreamOutput, build_response_with_conversation, build_stream_body_with_conversation,
@@ -99,6 +100,11 @@ pub struct CreateRequest {
     /// the conversation. It cannot be combined with `previous_response_id`.
     #[serde(default)]
     pub conversation: Option<String>,
+    /// OpenAI reasoning configuration (`PH-7`, `RD-28`). `effort` is
+    /// implemented and reaches the model's chat template. The other contract
+    /// members are rejected by name (`SP-NEVER-010`).
+    #[serde(default)]
+    pub reasoning: Option<ResponseReasoning>,
     /// OpenAI `background` (PH-6b, RD-24). `true` stores the response with
     /// status `queued`, returns it, and runs one generation in the background.
     /// It requires `store` to be `true` and it cannot be combined with
@@ -127,6 +133,8 @@ struct PreparedPrompt {
     user: String,
     format: StructuredFormat,
     tools: ToolRequest,
+    /// The decoded `reasoning` request (`RD-28`).
+    reasoning: ReasoningEffect,
 }
 
 /// Validate every supported-statefulness and model choice before generation.
@@ -173,6 +181,8 @@ fn validate(request: &CreateRequest, loaded_model: &str) -> Result<PreparedPromp
     )
     .map_err(|message| (400, message))?;
     let format = derive_format(request.text.as_ref()).map_err(|message| (400, message))?;
+    let reasoning =
+        derive_reasoning(request.reasoning.as_ref()).map_err(|message| (400, message))?;
     if tools.offers_tools() && format.json_required {
         // Combining the tool envelope with a structured output format needs two
         // grammars. The route does not implement the combination, so it
@@ -195,6 +205,7 @@ fn validate(request: &CreateRequest, loaded_model: &str) -> Result<PreparedPromp
         user,
         format,
         tools,
+        reasoning,
     })
 }
 
@@ -455,6 +466,7 @@ pub async fn create_response(
             tools: tools.clone(),
             grammar: grammar.map(str::to_string),
             json_required: format.json_required,
+            reasoning: prepared.reasoning.clone(),
             system,
             user,
             input_items,
@@ -485,7 +497,12 @@ pub async fn create_response(
         }
     }
 
-    match llm.run_prompt_usage_grammar(system, user, grammar, &crate::llm::Reasoning::default()) {
+    match llm.run_prompt_usage_grammar(
+        system,
+        user,
+        grammar,
+        &prepared.reasoning.as_reasoning(),
+    ) {
         Ok((text, usage)) => {
             let echo = ToolEcho::from_request(tools);
             let conversation_ref = conversation_id.as_deref();

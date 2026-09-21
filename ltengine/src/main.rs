@@ -22,6 +22,7 @@ mod responses_http;
 mod responses_input;
 mod responses_limits;
 mod responses_metadata;
+mod responses_reasoning;
 mod responses_retrieve;
 mod responses_schema;
 mod responses_shape;

@@ -53,12 +53,30 @@ used. `LTENGINE_SDK_VERSION_ANY=1` bypasses the pinned-SDK-version check.
 | Python | `tests/responses_smoke.py` | `python tests/responses_smoke.py` |
 | JavaScript | `tests/responses_smoke.mjs` | `node tests/responses_smoke.mjs` |
 
-Both clients are synchronous. Both send two non-streaming requests: one text
-`input` and one message-array `input`. Both verify the bearer credential, the
-`object` value `response`, the `resp_*` identifier, the loaded model, and
+Both clients are synchronous. Both send two non-streaming base requests: one
+text `input` and one message-array `input`. Both verify the bearer credential,
+the `object` value `response`, the `resp_*` identifier, the loaded model, and
 `output_text`. Request 1 sends a `metadata` object, and both clients check the
 `metadata` echo plus the required response fields `parallel_tool_calls`,
 `tool_choice`, and `tools`. Exit code 0 means every check passed.
+
+Both clients also cover every `SP-PLANNED` item that one default-configured
+server can show: a streamed request through the SDK stream helper
+(`SP-PLANNED-001`), the `usage` counts of a non-streaming response
+(`SP-PLANNED-002`), a `json_object` request and a strict `json_schema` request
+(`SP-PLANNED-003`), a `tool_choice` `required` function-call request
+(`SP-PLANNED-004`), a named `tool_choice` request with `parallel_tool_calls`
+`true` (`SP-PLANNED-005`), a stored response with `previous_response_id`,
+retrieval, deletion, and the input-item list (`SP-PLANNED-006` through
+`SP-PLANNED-009`), a conversation with items (`SP-PLANNED-010`), and a
+background response with polling and cancellation (`SP-PLANNED-011`), and the
+`reasoning` request field (`SP-PLANNED-013`). Those
+checks assert the response shape, the identifier prefixes, the event order, JSON
+validity, and the `usage` sum identity. They never assert a generated value. The
+stored and background checks delete the records that they create.
+`SP-PLANNED-012` is not a smoke case, because the limits need a server with a
+small limit value; section 15 holds its evidence. Section 16 records the live
+evidence for the rest.
 
 ## 4. Support matrix: `SP-MUST` capabilities
 
@@ -191,7 +209,8 @@ the pinned target. The two live runs in the first table are the exit-criterion
 evidence.
 
 This profile claims no full OpenAI parity (`SP-NEVER-012`). The live evidence
-covers the text scope of section 4 only.
+covers the text scope of section 4 only. Section 16 extends the live evidence to
+the `SP-PLANNED` items.
 
 ## 8. Correction after `PH-2`: `metadata` and the required response fields
 
@@ -355,7 +374,8 @@ Limits of this record:
    first event (`RD-13`).
 
 This profile claims no full OpenAI parity (`SP-NEVER-012`). The stream claim
-covers the text scope of section 4 only.
+covers the text scope of section 4 only. Section 16 extends the live evidence to
+the `SP-PLANNED` items.
 
 ## 10. `PH-4a`: structured output
 
@@ -401,7 +421,8 @@ Limits of this record:
    The converter's rejection set is the route's unsupported-schema set.
 3. `json_schema` with `strict` omitted defaults to non-strict. The OpenAI guides
    state no default for `text.format`.
-4. The SDK smoke tests of section 3 do not cover `SP-PLANNED-003` yet.
+4. The SDK smoke tests of section 3 cover `SP-PLANNED-003` after the extension
+   of section 16. That section records the live evidence.
 
 `SP-PLANNED-004` and `SP-PLANNED-005` stay with `PH-4b` and are not delivered.
 This profile still claims no full OpenAI parity (`SP-NEVER-012`).
@@ -450,6 +471,9 @@ Limits of this record:
 3. The transcription envelope is LTEngine-defined: `{"message": "..."}` or
    `{"calls": [...]}`. It is not an OpenAI wire format, and the model must be
    able to follow it.
+
+The SDK smoke tests cover the `function_call` item shape and the named
+`tool_choice` (section 16).
 
 `SP-PLANNED-003` is delivered by `PH-4a` (section 10). This profile still claims
 no full OpenAI parity (`SP-NEVER-012`).
@@ -612,3 +636,174 @@ Limits of this record:
 1. The storage limit counts records, not bytes (`RD-9`).
 2. A concurrent write can pass the check before another write lands. The next
    write rechecks the count.
+
+## 16. `SP-PLANNED` SDK smoke coverage
+
+The `PH-2` smoke tests covered the `SP-MUST` text scope (sections 7 and 8). This
+extension makes both compatibility-profile clients exercise every `SP-PLANNED`
+item that one default-configured server can show:
+
+| Capability | Request | Check |
+| ---------- | ------- | ----- |
+| `SP-PLANNED-001` | a streamed request through the SDK stream helper | the `RD-17` event order, an increasing `sequence_number`, and a final response that carries `output_text` |
+| `SP-PLANNED-002` | the two non-streaming text requests | `usage` is present, every count is a positive integer, and `total_tokens` equals `input_tokens + output_tokens` (`RD-18`) |
+| `SP-PLANNED-003` | `text.format.type` `json_object` | HTTP 200 and `output_text` parses as JSON |
+| `SP-PLANNED-003` | `text.format.type` `json_schema` with `strict: true` | HTTP 200, `output_text` parses as JSON, and the parsed object carries a string `answer` |
+| `SP-PLANNED-004` | one `get_weather` function tool with `tool_choice: "required"` | at least one `function_call` item with an `fc_*` id, a `call_*` `call_id`, the declared `name`, and `arguments` that parse as JSON |
+| `SP-PLANNED-005` | `tool_choice: {"type":"function","name":"get_weather"}` with `parallel_tool_calls: true` | the named call, and the `parallel_tool_calls` echo `true` |
+| `SP-PLANNED-006` | `store: true`, then a retrieve by id | the retrieve carries the same `resp_*` id |
+| `SP-PLANNED-007` | a second request with `previous_response_id` | a new, different `resp_*` id |
+| `SP-PLANNED-008` | delete the stored response, then retrieve it | the delete succeeds, and the retrieve returns the `RD-22` HTTP 404 |
+| `SP-PLANNED-009` | list the input items of the stored response | the stored `user` input item is listed |
+| `SP-PLANNED-010` | create a conversation, add an item, list the items, create a response with the `conversation` field, and delete the conversation | a `conv_*` id, the listed `user` item, a `resp_*` id, and the `conversation.deleted` delete result |
+| `SP-PLANNED-011` | `background: true` with polling; then a second job with `POST .../cancel` and a second cancel | the created response is `queued`, every observed status is declared, the job reaches `completed`, the cancel reaches `cancelled`, and the second cancel is idempotent |
+| `SP-PLANNED-012` | not a smoke case | The limits need a server that carries a small `--max-stored-responses` or `--retention-secs` value. The `PH-6c` unit tests and dedicated-server live run are the evidence (section 15). |
+| `SP-PLANNED-013` | `reasoning: {"effort": "low"}` through the SDK | HTTP 200 and a `resp_*` id; then `reasoning: {"effort": "enormous"}` is a 400 whose message names `reasoning.effort` |
+
+The requests use the loaded local model, so no check asserts generated text, a
+generated argument value, or a call count above one. `tool_choice: "auto"` is
+not a smoke case: the route permits a message instead of a call under `auto`, so
+a call assertion would be flaky. The `PH-4` gate covers `auto`. The tool
+streaming events stay with the `PH-4b` record of section 11.
+
+`SP-PLANNED-001` needs one streamed request, so the clients are no longer
+non-streaming only. That extends the `RD-8` wording, which records non-streaming
+text input and message-array input. The owner directed the extension; the `RD-8`
+rows would need an update to match the current test target.
+
+Live evidence, local fixture `http://127.0.0.1:5051/v1`, key `ph1-test-key`,
+loaded model = the full `--model-file` GGUF path:
+
+| Client | SDK and runtime | Command | Result |
+| ------ | --------------- | ------- | ------ |
+| Python | `openai` 3.14.1 on Python 3.13.5 | `python tests/responses_smoke.py` | `PASS`: exit 0, every check passed |
+| JavaScript | `openai` 7.15.0 on Node v24.16.0 | `node tests/responses_smoke.mjs` | `PASS`: exit 0, every check passed |
+
+The Python client ran in a temporary virtual environment that carried the pinned
+`openai` 3.14.1. The JavaScript client resolved the pinned `openai` 7.15.0 from a
+scratch `node_modules`, and the scratch copy of the script was byte-identical to
+the tracked file (`cmp`). The server was stopped after the runs.
+
+Negative controls confirmed that the new checks report a failure instead of
+passing vacuously:
+
+| Check | Expected | Observed |
+| ----- | -------- | -------- |
+| `verify_function_call` with the wrong expected tool name | `FAIL` | `FAIL` on the name check, exit 1 |
+| `verify_json_text` on a `function_call` response | `FAIL` | `FAIL`, because `output_text` is empty |
+| A request that names an undeclared tool | a reported `FAIL`, no crash | `FAIL` with the HTTP 400 message, exit 1 |
+| `expect_not_found` on a call that succeeds | `FAIL` | `FAIL`: `the request succeeded`, exit 1 |
+| `verify_usage` with a wrong `total_tokens` | `FAIL` | `FAIL` on the sum check |
+| `verify_usage` with `usage` `null` | `FAIL` | `FAIL`: `usage is null` |
+
+### 16.1 Grammar on the MTP decode path
+
+`PH-4a` removed a redundant `sampler.accept` call that exhausted a grammar
+sampler (section 10; `PH-4` design, section 4.5). The MTP decode path shares
+`create_sampler` and the same loop rule, so this extension re-checked the
+combination of a grammar with `--mtp-model-file`. The combination was `UNKNOWN`
+before this run.
+
+Live evidence, the approved Gemma 4 target and MTP draft pair, server
+`http://127.0.0.1:5056/v1`, `--mtp-n-max 2`:
+
+| Check | Result |
+| ----- | ------ |
+| Strict `json_schema` request | `PASS`: HTTP 200 and `output_text` parsed to a JSON object with a string `answer` |
+| `json_object` request | `PASS`: HTTP 200 and a JSON object |
+| Strict function tool with `tool_choice: "required"` | `PASS`: one `function_call` item named `get_weather` with parseable `arguments` |
+| Plain text request | `PASS`: HTTP 200 with text |
+| Streamed `json_object` request | `PASS`: the `RD-17` event order with `sequence_number` 0 through 8 |
+| MTP path engaged | `PASS`: the server log recorded `ltengine: MTP draft model loaded` and an `ltengine: MTP proposed ..., accepted ...` line for every request |
+
+The pair byte sizes match the approved values of the `PH-3` record (3,349,516,256
+and 97,835,456 bytes). The server was stopped after the run, and port 5056 is
+free.
+
+Limits of this record:
+
+1. The SDK checks assert the response shape, the event order, and JSON validity.
+   They do not assert a generated text, a generated `arguments` value, or more
+   than one call.
+2. `parallel_tool_calls: true` permits several calls. The smoke case accepts one
+   or more, because the call count depends on the model.
+3. The MTP pair check ran on one prompt per case. It is a live smoke check, not a
+   token-level parity measurement.
+
+## 17. `PH-7`: reasoning effort
+
+`PH-7` delivers `SP-PLANNED-013` under `RD-28`. The route accepts the OpenAI
+`reasoning` request object and carries `effort` to the loaded model's chat
+template.
+
+| Field | Behavior |
+| ----- | -------- |
+| `reasoning.effort` | One of `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, which are the values of the pinned SDKs (`RD-8`). Any other value, and any value that is not a string, is a 400 that names `reasoning.effort`. |
+| `reasoning.effort: "none"` | The template's `enable_thinking` variable is `false`. |
+| `reasoning` without `effort`, or with `effort: null` | The template's `enable_thinking` variable is `true`, and no `reasoning_effort` is set, so the template's own default applies. |
+| `reasoning` absent | Unchanged from before `RD-28`: `enable_thinking` is `false` and no `reasoning_effort` is set. |
+| `reasoning.context`, `reasoning.generate_summary`, `reasoning.mode`, `reasoning.summary` | Part of the OpenAI contract, not implemented. A present, non-`null` value is a 400 that names the member (`SP-NEVER-010`). |
+| A member outside the contract | A 400 from the request-body decode, which names the field. |
+| `reasoning` that is not an object | A 400 from the request-body decode. This matches the existing behavior of `text` and every other object-typed field. |
+| Non-streaming and streamed requests | The same effect. `reasoning` is a generation input, so it does not change the `RD-17` event order. |
+| A background request | The job carries the decoded `reasoning`, so `background: true` honors the field. |
+| Reasoning output | The generated text must not carry the reasoning trace (`SP-NEVER-003`). A leading `<think>...</think>` block is removed before `output_text` is built, together with the Gemma channel markers that were already removed. |
+
+The value reaches the template as its `reasoning_effort` variable, and
+`enable_thinking` is the template's own boolean variable. Both are fields of
+llama.cpp's `common_chat_templates_inputs`: `enable_thinking` directly, and
+`reasoning_effort` through `chat_template_kwargs`. `RD-28` therefore pins
+`llama-cpp-2` to the fork revision that forwards `chat_template_kwargs`
+(`llama-cpp-rs` `main` at `262eab2`, which carries the Minja chat-template
+binding and the keyword forward).
+
+Live evidence, local fixture `http://127.0.0.1:5051/v1`, key `ph1-test-key`,
+loaded model = the full `--model-file` GGUF path of the Gemma 3 1B fixture:
+
+| Request | Result |
+| ------- | ------ |
+| No `reasoning` | `PASS`: HTTP 200 |
+| `reasoning: {"effort": "low"}` | `PASS`: HTTP 200 |
+| `reasoning: {}` | `PASS`: HTTP 200 |
+| `reasoning: {"effort": "none"}` | `PASS`: HTTP 200 |
+| `reasoning: {"effort": null}` | `PASS`: HTTP 200 |
+| `reasoning: {"effort": "enormous"}` | `PASS`: HTTP 400 `` `reasoning.effort` `enormous` is not supported; use one of none, minimal, low, medium, high, xhigh, max `` |
+| `reasoning: {"effort": 3}` | `PASS`: HTTP 400 `` `reasoning.effort` must be a string `` |
+| `reasoning: {"summary": "auto"}` | `PASS`: HTTP 400 `` `reasoning.summary` is not implemented on this route `` |
+| `reasoning: {"context": "auto"}` | `PASS`: HTTP 400, names `reasoning.context` |
+| `reasoning: {"mode": "pro"}` | `PASS`: HTTP 400, names `reasoning.mode` |
+| `reasoning: {"generate_summary": "auto"}` | `PASS`: HTTP 400, names `reasoning.generate_summary` |
+| `reasoning: {"bogus": 1}` | `PASS`: HTTP 400 from the body decode, which names `bogus` |
+| `reasoning: "low"` | `PASS`: HTTP 400 from the body decode, for the expected struct |
+
+The two SDK clients ran with the added `SP-PLANNED-013` case and reported
+`RESULT PASS`:
+
+| Client | SDK and runtime | Command | Result |
+| ------ | --------------- | ------- | ------ |
+| Python | `openai` 2.54.0 on Python 3.13.5 | `python tests/responses_smoke.py` | `PASS`: exit 0 |
+| JavaScript | `openai` 7.15.0 on Node v24.16.0 | `node tests/responses_smoke.mjs` | `PASS`: exit 0 |
+
+The Python client ran in version-any mode, because this environment carries
+`openai` 2.54.0 and not the pinned 3.14.1. The JavaScript client used the pinned
+`openai` 7.15.0, resolved from a scratch `node_modules` outside the checkout, and
+the scratch copy of the script was byte-identical to the tracked file. The server
+was stopped after the runs.
+
+`PH-1` still passes after the change: `bin/lt ph1` reported 60 checks ok of 60.
+The Rust suite reported 117 tests passed.
+
+Limits of this record:
+
+1. No check asserts a generated value. The route's contract is the request
+   field, the template variables, and the rejection messages.
+2. The template-variable delivery is covered by two unit checks rather than by a
+   live model: the `llama-cpp-rs` test renders a literal template with
+   `reasoning_effort` and asserts the rendered prompt, and the `ltengine` test
+   asserts that a plain effort value becomes the JSON keyword the binding takes.
+   A live model whose template reads `reasoning_effort` was not available in this
+   environment, so the end-to-end effect on a generated response is `UNKNOWN`.
+3. The Gemma 3 1B fixture's template does not read `reasoning_effort`, so the
+   live runs above show acceptance and rejection, not a changed generated text.
+4. An output that is only an unterminated `<think>` block is an empty output,
+   which is the existing `Model produced empty output` error (HTTP 500).

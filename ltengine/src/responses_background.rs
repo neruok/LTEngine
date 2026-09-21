@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 use crate::Args;
 use crate::llm::{self, TokenUsage};
 use crate::responses_http::{error_json, not_found, strict_guard};
+use crate::responses_reasoning::ReasoningEffect;
 use crate::responses_shape::{
     build_response_object, calls_output, message_output, new_id, now_secs, usage_json,
 };
@@ -29,6 +30,7 @@ pub(crate) trait Generate: Send + Sync {
         system: String,
         user: String,
         grammar: Option<String>,
+        reasoning: ReasoningEffect,
         cancel: Arc<AtomicBool>,
     ) -> anyhow::Result<(String, TokenUsage)>;
 }
@@ -39,6 +41,7 @@ impl Generate for llm::LLM {
         system: String,
         user: String,
         grammar: Option<String>,
+        reasoning: ReasoningEffect,
         cancel: Arc<AtomicBool>,
     ) -> anyhow::Result<(String, TokenUsage)> {
         self.run_prompt_usage_grammar_cancellable(
@@ -46,7 +49,7 @@ impl Generate for llm::LLM {
             user,
             grammar.as_deref(),
             Some(cancel.as_ref()),
-            &llm::Reasoning::default(),
+            &reasoning.as_reasoning(),
         )
     }
 }
@@ -104,6 +107,8 @@ pub(crate) struct BackgroundRequest {
     pub tools: ToolRequest,
     pub grammar: Option<String>,
     pub json_required: bool,
+    /// The decoded `reasoning` request (`RD-28`).
+    pub reasoning: ReasoningEffect,
     pub system: String,
     pub user: String,
     pub input_items: Vec<Value>,
@@ -192,6 +197,7 @@ impl BackgroundJob {
             request.system.clone(),
             request.user.clone(),
             request.grammar.clone(),
+            request.reasoning.clone(),
             Arc::clone(&cancel),
         );
         let completed = match result {
@@ -348,6 +354,7 @@ mod tests {
             _system: String,
             _user: String,
             _grammar: Option<String>,
+            _reasoning: ReasoningEffect,
             cancel: Arc<AtomicBool>,
         ) -> anyhow::Result<(String, TokenUsage)> {
             match &self.behavior {
@@ -379,6 +386,7 @@ mod tests {
             tools: crate::responses_tools::parse_tools(None, None, None).expect("no tools"),
             grammar: None,
             json_required: false,
+            reasoning: ReasoningEffect::default(),
             system: String::new(),
             user: "hi".to_string(),
             input_items: Vec::new(),
