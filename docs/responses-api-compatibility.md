@@ -356,6 +356,12 @@ The MTP rows use this model pair:
 | Target | `/root/.cache/ltengine-ph3-mtp/gemma-4-E2B_q4_0-it.gguf` | 3,349,516,256 |
 | Draft | `/root/.cache/ltengine-ph3-mtp/gemma-4-E2B-it-qat-assistant-MTP-Q8_0.gguf` | 97,835,456 |
 
+The pair was later moved to the shared
+`/root/Workspace/git/llm-api/local-models/` directory, where the two files keep
+the byte sizes above. The `## Testing models` section of the harness
+`docs/development.md` is the current record of their location, size, and
+SHA-256 value.
+
 The MTP rows use a different request and a different model from the rows above
 them. Compare each row with its own request only. The `output_tokens` value of
 50 holds the accepted draft tokens, because the MTP server counted them
