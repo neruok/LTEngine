@@ -15,7 +15,7 @@ hf-hub = { version = "0.3.2" }
 anyhow = "1.0.104"
 thiserror = { workspace = true }
 parking_lot = "0.12.5"
-llama-cpp-2 = { git = "https://github.com/neruok/llama-cpp-rs", rev = "e759604379f7c056445a3bb9d760ea5c3ad40aa2" }
+llama-cpp-2 = { git = "https://github.com/neruok/llama-cpp-rs", rev = "262eab2cb2633e8263716441dd0cdcb839c8177f" }
 encoding_rs = "0.8.35"
 actix-multipart = "0.7.2"
 whatlang = "0.16.4"

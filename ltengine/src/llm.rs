@@ -70,6 +70,32 @@ fn pick_n_ubatch(use_gpu: bool) -> u32 {
     default
 }
 
+/// The reasoning controls that reach the model's chat template (`RD-28`).
+///
+/// [`Reasoning::default`] is the behavior that predates `RD-28`: the template's
+/// `enable_thinking` variable is false and no `reasoning_effort` is set.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Reasoning<'a> {
+    /// The template's `enable_thinking` variable.
+    pub thinking: bool,
+    /// The `reasoning_effort` template variable, as a plain value such as
+    /// `"low"`. `None` leaves the template's own default in place.
+    pub effort: Option<&'a str>,
+}
+
+/// The template keywords for `reasoning` (`RD-28`).
+///
+/// The binding takes JSON text, so the plain effort value is encoded here.
+fn reasoning_kwargs(reasoning: &Reasoning<'_>) -> Vec<(&'static str, String)> {
+    match reasoning.effort {
+        Some(effort) => vec![(
+            "reasoning_effort",
+            serde_json::Value::String(effort.to_owned()).to_string(),
+        )],
+        None => Vec::new(),
+    }
+}
+
 pub struct LLM {
     backend: LlamaBackend,
     model: LlamaModel,
@@ -232,6 +258,19 @@ impl LLM {
     }
 
     pub fn run_prompt(&self, system: String, user: String) -> Result<String>{
+        self.run_prompt_reasoning(system, user, &Reasoning::default())
+    }
+
+    /// Run one generation with explicit reasoning controls (`RD-28`).
+    ///
+    /// [`LLM::run_prompt`] delegates with [`Reasoning::default`], so every
+    /// caller that predates `RD-28` keeps its behavior.
+    pub fn run_prompt_reasoning(
+        &self,
+        system: String,
+        user: String,
+        reasoning: &Reasoning<'_>,
+    ) -> Result<String> {
         let messages = [
             LlamaChatMessage::new("user".to_string(), format!("{system}\n\n{user}"))
                 .context("Failed to build chat message")?
@@ -242,8 +281,13 @@ impl LLM {
         // the built-in name list cannot (e.g. Gemma 4).
         let template = LlamaMinjaChatTemplate::from_model(&self.model)
             .with_context(|| "Model has no usable embedded chat template")?;
+        let kwargs = reasoning_kwargs(reasoning);
+        let kwargs_refs: Vec<(&str, &str)> = kwargs
+            .iter()
+            .map(|(key, value)| (*key, value.as_str()))
+            .collect();
         let llm_input = template
-            .render(&messages, true, false)
+            .render_with_kwargs(&messages, true, reasoning.thinking, &kwargs_refs)
             .with_context(|| "Failed to apply the model's chat template")?;
 
         // llama.cpp strips a leading BOS from the rendered text whenever the
@@ -512,6 +556,7 @@ fn append_token(
 }
 
 fn clean_output(output: String) -> Result<String> {
+    let output = strip_thinking_block(output);
     let output = if let Some(pos) = output.find("<channel|>") {
         output[pos + "<channel|>".len()..].to_owned()
     } else if let Some(rest) = output.strip_prefix("<|channel>thought") {
@@ -525,6 +570,23 @@ fn clean_output(output: String) -> Result<String> {
         anyhow::bail!("Model produced empty output");
     }
     Ok(output)
+}
+
+/// Remove a leading thinking block, so a reasoning trace never reaches the
+/// response text (`SP-NEVER-003`, `RD-28`).
+///
+/// An unterminated block leaves nothing behind, and [`clean_output`] then
+/// reports the empty output. An output with no leading block is unchanged.
+fn strip_thinking_block(output: String) -> String {
+    const OPEN: &str = "<think>";
+    const CLOSE: &str = "</think>";
+    let Some(rest) = output.trim_start().strip_prefix(OPEN) else {
+        return output;
+    };
+    match rest.find(CLOSE) {
+        Some(end) => rest[end + CLOSE.len()..].trim_start().to_owned(),
+        None => String::new(),
+    }
 }
 
 /// Which MTP decode path `LLM::new` selects.
@@ -631,7 +693,8 @@ impl LLMContext<'_>{
 #[cfg(test)]
 mod tests {
     use super::{
-        clean_output, mtp_mode, parse_nextn_layers, validate_mtp_n_max, MtpMode,
+        clean_output, mtp_mode, parse_nextn_layers, reasoning_kwargs, validate_mtp_n_max, MtpMode,
+        Reasoning,
     };
 
     #[test]
@@ -670,5 +733,50 @@ mod tests {
             clean_output("<|channel>thought answer<end_of_turn>".into()).unwrap(),
             "answer"
         );
+    }
+
+    /// `RD-28`, `SP-NEVER-003`: the reasoning trace never reaches the text.
+    #[test]
+    fn removes_a_leading_thinking_block() {
+        assert_eq!(
+            clean_output("<think>\nreasoning here\n</think>\nThe answer.".into()).unwrap(),
+            "The answer."
+        );
+        assert_eq!(
+            clean_output("<think>reasoning</think>Answer".into()).unwrap(),
+            "Answer"
+        );
+    }
+
+    /// An unterminated block leaves no answer behind, which is an error rather
+    /// than a trace in the response text.
+    #[test]
+    fn rejects_output_that_is_only_a_thinking_block() {
+        assert!(clean_output("<think>reasoning without an end".into()).is_err());
+    }
+
+    /// `RD-28`, preserved behavior: an output with no thinking block is
+    /// returned unchanged.
+    #[test]
+    fn keeps_output_without_a_thinking_block() {
+        assert_eq!(clean_output("plain answer".into()).unwrap(), "plain answer");
+    }
+
+    /// `RD-28`: the effort reaches the template as JSON text, and an absent
+    /// effort adds no keyword.
+    #[test]
+    fn encodes_the_reasoning_effort_as_json() {
+        assert_eq!(
+            reasoning_kwargs(&Reasoning {
+                thinking: true,
+                effort: Some("low"),
+            }),
+            vec![("reasoning_effort", "\"low\"".to_string())]
+        );
+        assert!(reasoning_kwargs(&Reasoning {
+            thinking: true,
+            effort: None,
+        })
+        .is_empty());
     }
 }
