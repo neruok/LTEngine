@@ -74,6 +74,7 @@ pub struct LLM {
     backend: LlamaBackend,
     model: LlamaModel,
     mtp_model: Option<LlamaModel>,
+    self_mtp: bool,
     mtp_n_max: i32,
     prompt_lock: Mutex<()>,
     n_ubatch: u32,
@@ -93,7 +94,12 @@ impl LLM {
         cpu: bool,
         verbose: bool,
     ) -> Result<Self> {
-        if mtp_model_path.is_some() {
+        let has_draft_file = mtp_model_path.is_some();
+        // A target GGUF can carry its own nextn/MTP head. The loader skips those
+        // tensors unless `load_mtp` is set, so request them when no draft file
+        // is configured. Architectures without the head ignore the flag.
+        let load_mtp = !has_draft_file;
+        if has_draft_file {
             validate_mtp_n_max(mtp_n_max)?;
         }
         if !verbose {
@@ -108,7 +114,7 @@ impl LLM {
             let model = loop {
                 let model = match LlamaModel::load_from_file(
                     &backend, &model_path,
-                    &LlamaModelParams::default().with_n_gpu_layers(n_gpu),
+                    &LlamaModelParams::default().with_n_gpu_layers(n_gpu).with_load_mtp(load_mtp),
                 ) {
                     Ok(m) => m,
                     Err(_) => {
@@ -160,7 +166,7 @@ impl LLM {
         } else {
             let model = LlamaModel::load_from_file(
                 &backend, model_path,
-                &LlamaModelParams::default().with_n_gpu_layers(0),
+                &LlamaModelParams::default().with_n_gpu_layers(0).with_load_mtp(load_mtp),
             ).with_context(|| "Unable to load model")?;
             (model, None)
         };
@@ -169,6 +175,22 @@ impl LLM {
             .map(|path| load_mtp_model(&backend, &path, use_gpu))
             .transpose()?;
         let n_ubatch = pick_n_ubatch(use_gpu);
+
+        // Self-speculative decoding: the target model drafts with its own
+        // nextn/MTP head, so no second model file is needed.
+        let nextn_layers = if has_draft_file { 0 } else { nextn_predict_layers(&model) };
+        let self_mtp = match mtp_mode(has_draft_file, nextn_layers) {
+            MtpMode::SelfMtp => {
+                validate_mtp_n_max(mtp_n_max)?;
+                probe_mtp(&backend, &model, &model, mtp_n_max, n_ubatch)?;
+                eprintln!(
+                    "ltengine: MTP head found in the target model ({} nextn layer(s)), self-speculative decoding enabled",
+                    nextn_layers
+                );
+                true
+            }
+            _ => false,
+        };
 
         if let Some(draft) = &mtp_model {
             validate_mtp_pair(&model, draft)?;
@@ -186,6 +208,7 @@ impl LLM {
             backend,
             model,
             mtp_model,
+            self_mtp,
             mtp_n_max,
             prompt_lock: Mutex::new(()),
             n_ubatch,
@@ -242,7 +265,7 @@ impl LLM {
         // one at a time.
         let _lock = self.prompt_lock.try_lock_for(Duration::from_secs(120))
             .ok_or(LLMError::Busy)?;
-        if self.mtp_model.is_some() {
+        if self.mtp_model.is_some() || self.self_mtp {
             self.process_mtp(tokens_list, ctx_size)
         } else {
             let mut ctx = self.create_context(ctx_size)?;
@@ -251,7 +274,9 @@ impl LLM {
     }
 
     fn process_mtp(&self, tokens_list: Vec<LlamaToken>, output_limit: i32) -> Result<String> {
-        let mtp_model = self.mtp_model.as_ref().context("MTP model is not loaded")?;
+        // The draft model is the separate `--mtp-model-file` model when present,
+        // and otherwise the target model's own nextn/MTP head.
+        let mtp_model = self.mtp_model.as_ref().unwrap_or(&self.model);
         let context_size = output_limit + self.mtp_n_max + 1;
         let n_ctx = NonZeroU32::new(context_size.try_into()?).context("Invalid context size")?;
         let n_rs_seq = self.mtp_n_max.max(4).try_into()?;
@@ -502,6 +527,48 @@ fn clean_output(output: String) -> Result<String> {
     Ok(output)
 }
 
+/// Which MTP decode path `LLM::new` selects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MtpMode {
+    /// No MTP. The single-token decode path.
+    Off,
+    /// `--mtp-model-file` names a separate MTP draft model.
+    DraftFile,
+    /// The target GGUF carries its own nextn/MTP head.
+    SelfMtp,
+}
+
+/// The MTP decision rule: a draft file wins; otherwise a target that reports a
+/// nextn head drafts for itself; otherwise MTP stays off.
+fn mtp_mode(has_draft_file: bool, nextn_layers: i32) -> MtpMode {
+    if has_draft_file {
+        MtpMode::DraftFile
+    } else if nextn_layers > 0 {
+        MtpMode::SelfMtp
+    } else {
+        MtpMode::Off
+    }
+}
+
+/// Parse a `<architecture>.nextn_predict_layers` metadata value. llama.cpp
+/// renders an integer metadata value as its decimal string. A missing or
+/// unusable value reports `0`.
+fn parse_nextn_layers(value: Option<&str>) -> i32 {
+    value
+        .and_then(|value| value.trim().parse::<i32>().ok())
+        .unwrap_or(0)
+}
+
+/// Read `<architecture>.nextn_predict_layers` from the model metadata.
+fn nextn_predict_layers(model: &LlamaModel) -> i32 {
+    let architecture = match model.meta_val_str("general.architecture") {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    let key = format!("{}.nextn_predict_layers", architecture.trim());
+    parse_nextn_layers(model.meta_val_str(&key).ok().as_deref())
+}
+
 fn validate_mtp_n_max(value: i32) -> Result<()> {
     if !(1..=16).contains(&value) {
         anyhow::bail!("MTP draft token count must be between 1 and 16");
@@ -563,7 +630,27 @@ impl LLMContext<'_>{
 
 #[cfg(test)]
 mod tests {
-    use super::{clean_output, validate_mtp_n_max};
+    use super::{
+        clean_output, mtp_mode, parse_nextn_layers, validate_mtp_n_max, MtpMode,
+    };
+
+    #[test]
+    fn selects_self_mtp_only_for_a_baked_in_head() {
+        assert_eq!(mtp_mode(true, 0), MtpMode::DraftFile);
+        assert_eq!(mtp_mode(true, 4), MtpMode::DraftFile);
+        assert_eq!(mtp_mode(false, 1), MtpMode::SelfMtp);
+        assert_eq!(mtp_mode(false, 0), MtpMode::Off);
+        assert_eq!(mtp_mode(false, -1), MtpMode::Off);
+    }
+
+    #[test]
+    fn parses_the_nextn_layer_count() {
+        assert_eq!(parse_nextn_layers(Some("1")), 1);
+        assert_eq!(parse_nextn_layers(Some(" 2 ")), 2);
+        assert_eq!(parse_nextn_layers(Some("junk")), 0);
+        assert_eq!(parse_nextn_layers(Some("")), 0);
+        assert_eq!(parse_nextn_layers(None), 0);
+    }
 
     #[test]
     fn validates_mtp_draft_count() {

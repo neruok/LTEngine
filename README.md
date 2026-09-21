@@ -43,7 +43,7 @@ To run different LLM models:
 ```bash
 ./target/release/ltengine -m gemma3-12b [--model-file /path/to/model.gguf]
 
-# Use a compatible MTP draft model.
+# Use a compatible MTP draft model, or a model with a baked-in MTP head.
 ./target/release/ltengine \
   --model-file /path/to/target.gguf \
   --mtp-model-file /path/to/mtp-draft.gguf \
@@ -66,14 +66,37 @@ Memory usage numbers are approximate.
 ### MTP speculative decoding
 
 MTP speculative decoding can increase generation speed for compatible models.
-It requires a target GGUF and its matching MTP draft GGUF.
+There are two ways to enable it.
 
-Use `--mtp-model-file` to enable MTP.
+**A model with a baked-in MTP head.** Some GGUFs carry their own nextn/MTP head
+(the same file holds an extra prediction block, for example a Qwen3.5/3.8 GGUF
+with `nextn_predict_layers`). LTEngine detects the head and uses it
+automatically: the target model drafts for itself, so you pass one file only.
+
+```bash
+./target/release/ltengine \
+  --model-file /path/to/model-with-mtp-head.gguf \
+  --mtp-n-max 3
+```
+
+**A separate MTP draft model.** A model without a baked-in head can still use
+MTP when a matching draft GGUF exists. Use `--mtp-model-file` to name it.
+LTEngine checks vocabulary size, type, BOS token, and embedding width during
+startup.
+
+```bash
+./target/release/ltengine \
+  --model-file /path/to/target.gguf \
+  --mtp-model-file /path/to/mtp-draft.gguf \
+  --mtp-n-max 3
+```
+
 Use `--mtp-n-max` to set the maximum draft length from 1 through 16.
-The default draft length is 3.
+The default draft length is 3. LTEngine validates the value when the model uses
+MTP, and does not check it for a model with neither MTP source.
 
 The Docker image uses `LTENGINE_MTP_MODEL_FILE` and `LTENGINE_MTP_N_MAX` for these options.
-LTEngine checks vocabulary size, type, BOS token, and embedding width during startup.
+`LTENGINE_MTP_MODEL_FILE` is optional: leave it unset to use a baked-in MTP head.
 
 ```yaml
 environment:
@@ -82,8 +105,8 @@ environment:
   LTENGINE_MTP_N_MAX: 3
 ```
 
-Do not set `LTENGINE_MTP_MODEL_FILE` for models that do not support MTP.
-LTEngine uses its normal single-token decode path when this variable is not set.
+LTEngine uses its normal single-token decode path when neither a baked-in MTP
+head nor `LTENGINE_MTP_MODEL_FILE` is present.
 
 ### Simple
 
