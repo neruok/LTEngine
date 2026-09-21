@@ -753,7 +753,7 @@ template.
 | `reasoning` that is not an object | A 400 from the request-body decode. This matches the existing behavior of `text` and every other object-typed field. |
 | Non-streaming and streamed requests | The same effect. `reasoning` is a generation input, so it does not change the `RD-17` event order. |
 | A background request | The job carries the decoded `reasoning`, so `background: true` honors the field. |
-| Reasoning output | The generated text must not carry the reasoning trace (`SP-NEVER-003`). A leading `<think>...</think>` block is removed before `output_text` is built, together with the Gemma channel markers that were already removed. |
+| Reasoning output | The generated text must not carry the reasoning trace (`SP-NEVER-003`). A template that leaves the thinking tags to the model emits a leading `<think>...</think>` block, which is removed before `output_text` is built, together with the Gemma channel markers that were already removed. A template that opens the block in its generation prompt leaves `<think>` in the prompt, so the output starts with the reasoning text and ends it at a bare `</think>`; that form is removed only when the request asked for thinking, because that template's non-thinking form emits a closed block and a `</think>` in its output is then answer text. |
 
 The value reaches the template as its `reasoning_effort` variable, and
 `enable_thinking` is the template's own boolean variable. Both are fields of
@@ -782,6 +782,35 @@ loaded model = the full `--model-file` GGUF path of the Gemma 3 1B fixture:
 | `reasoning: {"bogus": 1}` | `PASS`: HTTP 400 from the body decode, which names `bogus` |
 | `reasoning: "low"` | `PASS`: HTTP 400 from the body decode, for the expected struct |
 
+The Gemma 3 1B fixture does not read `reasoning_effort`, so its table above
+shows acceptance and rejection only. A second local fixture,
+`Cyber-Tiel-Coder-35B-A3B-MTP-UD-IQ4_XS.gguf`, is a `qwen35moe`
+mixture-of-experts model that carries its own `nextn` MTP head and whose
+template reads `reasoning_effort`. Its template opens the thinking block in the
+generation prompt, so the generated text starts with the trace and ends it at a
+bare `</think>`. That trace reached `output_text` before this change; the table
+below is the result after it. The loaded model equals the full `--model-file`
+path of that fixture.
+
+| Request | `input_tokens` / `output_tokens` | `output_text` | Result |
+| ------- | -------------------------------- | ------------- | ------ |
+| `reasoning` absent | 196 / 1 | `OK` | `PASS`: no marker |
+| `reasoning: {"effort": "none"}` | 196 / 1 | `OK` | `PASS`: no marker, and equal to the absent case |
+| `reasoning: {}` | 195 / 15 | `OK` | `PASS`: the trace tokens were generated, counted, and removed |
+| `reasoning: {"effort": "low"}` | 221 / 14 | `OK` | `PASS`: the trace tokens were generated, counted, and removed |
+| `reasoning: {"effort": "high"}` | 233 / 13 | `OK` | `PASS`: the trace tokens were generated, counted, and removed |
+| `reasoning: {"effort": "max"}` | 233 / 13 | `OK` | `PASS`: equals `high`, which is the template's own `xhigh` mapping |
+| `{"effort": "high", "stream": true}` | 233 / 13 | `OK` | `PASS`: 9 SSE events in the `RD-17` order, no marker in the delta text |
+| `{"effort": "high", "background": true}` | 233 / 13 | `OK` | `PASS`: status `queued` then `completed`, no marker |
+| Multi-step arithmetic, `{"effort": "high"}` | 294 / 159 | the answer, ending `16` | `PASS`: the 197-character trace and its `</think>` were removed |
+
+`output_tokens` is greater than 1 while `output_text` is `OK`, which is the
+evidence that the trace was generated and counted (`RD-18`) and then removed
+from the text. The arithmetic request before the change returned the
+197-character trace, a literal `</think>`, then the answer; it now returns the
+answer only, with byte-identical `output_tokens` (159) and identical MTP
+counters (150 proposed, 109 accepted). The change is presentation only.
+
 The two SDK clients ran with the added `SP-PLANNED-013` case and reported
 `RESULT PASS`:
 
@@ -797,19 +826,23 @@ the scratch copy of the script was byte-identical to the tracked file. The serve
 was stopped after the runs.
 
 `PH-1` still passes after the change: `bin/lt ph1` reported 60 checks ok of 60.
-The Rust suite reported 117 tests passed.
+The Rust suite reported 123 tests passed.
 
 Limits of this record:
 
 1. No check asserts a generated value. The route's contract is the request
    field, the template variables, and the rejection messages.
-2. The template-variable delivery is covered by two unit checks rather than by a
-   live model: the `llama-cpp-rs` test renders a literal template with
-   `reasoning_effort` and asserts the rendered prompt, and the `ltengine` test
-   asserts that a plain effort value becomes the JSON keyword the binding takes.
-   A live model whose template reads `reasoning_effort` was not available in this
-   environment, so the end-to-end effect on a generated response is `UNKNOWN`.
-3. The Gemma 3 1B fixture's template does not read `reasoning_effort`, so the
+2. The template-variable delivery is covered by two unit checks and by the
+   `Cyber-Tiel-Coder` fixture above: the `llama-cpp-rs` test renders a literal
+   template with `reasoning_effort` and asserts the rendered prompt, the
+   `ltengine` test asserts that a plain effort value becomes the JSON keyword
+   the binding takes, and the live fixture records the changed generated text.
+3. The Gemma 3 1B fixture's template does not read `reasoning_effort`, so its
    live runs above show acceptance and rejection, not a changed generated text.
 4. An output that is only an unterminated `<think>` block is an empty output,
    which is the existing `Model produced empty output` error (HTTP 500).
+5. The `Cyber-Tiel-Coder` fixture always selects the self-MTP decode path, so
+   its live runs verify the cleanup on that path only. `PH-1` on the Gemma 3 1B
+   fixture covers the single-token path for the routes, but that template emits
+   no bare `</think>`. The single-token path's cleanup rests on the `clean_output`
+   unit checks, not on a live request.

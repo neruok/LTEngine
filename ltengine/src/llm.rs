@@ -376,10 +376,10 @@ impl LLM {
         // one at a time.
         let _lock = self.lock_prompt(cancel)?;
         let (text, output_tokens) = if self.mtp_model.is_some() || self.self_mtp {
-            self.process_mtp(tokens_list, ctx_size, grammar, cancel)?
+            self.process_mtp(tokens_list, ctx_size, grammar, cancel, reasoning.thinking)?
         } else {
             let mut ctx = self.create_context(ctx_size)?;
-            ctx.process(tokens_list, grammar, cancel)?
+            ctx.process(tokens_list, grammar, cancel, reasoning.thinking)?
         };
         Ok((text, TokenUsage { input_tokens, output_tokens }))
     }
@@ -406,6 +406,7 @@ impl LLM {
         output_limit: i32,
         grammar: Option<&str>,
         cancel: Option<&AtomicBool>,
+        thinking: bool,
     ) -> Result<(String, u32)> {
         // The draft model is the separate `--mtp-model-file` model when present,
         // and otherwise the target model's own nextn/MTP head.
@@ -537,7 +538,7 @@ impl LLM {
         eprintln!(
             "ltengine: MTP proposed {proposed} tokens, accepted {accepted_total}"
         );
-        clean_output(output).map(|text| (text, usage.output_tokens))
+        clean_output(output, thinking).map(|text| (text, usage.output_tokens))
     }
 }
 
@@ -659,8 +660,8 @@ fn append_token(
     Ok(())
 }
 
-fn clean_output(output: String) -> Result<String> {
-    let output = strip_thinking_block(output);
+fn clean_output(output: String, thinking: bool) -> Result<String> {
+    let output = strip_thinking_block(output, thinking);
     let output = if let Some(pos) = output.find("<channel|>") {
         output[pos + "<channel|>".len()..].to_owned()
     } else if let Some(rest) = output.strip_prefix("<|channel>thought") {
@@ -676,21 +677,35 @@ fn clean_output(output: String) -> Result<String> {
     Ok(output)
 }
 
-/// Remove a leading thinking block, so a reasoning trace never reaches the
-/// response text (`SP-NEVER-003`, `RD-28`).
+/// Remove a reasoning trace, so it never reaches the response text
+/// (`SP-NEVER-003`, `RD-28`).
 ///
-/// An unterminated block leaves nothing behind, and [`clean_output`] then
-/// reports the empty output. An output with no leading block is unchanged.
-fn strip_thinking_block(output: String) -> String {
+/// Two template shapes produce a trace. A template that leaves the thinking
+/// tags to the model emits `<think>...</think>` in the output, which is the
+/// leading form. A template that opens the block in its generation prompt
+/// (`<|im_start|>assistant\n<think>\n`, the Qwen3.5/3.6 family) leaves the
+/// opening tag in the prompt, so the output starts with the reasoning text and
+/// ends the trace at a bare `</think>`; that form is removed only when the
+/// request asked for thinking. A request without thinking gets a closed block
+/// from the same template, so a `</think>` in its output is answer text.
+///
+/// An unterminated leading block leaves nothing behind, and [`clean_output`]
+/// then reports the empty output.
+fn strip_thinking_block(output: String, thinking: bool) -> String {
     const OPEN: &str = "<think>";
     const CLOSE: &str = "</think>";
-    let Some(rest) = output.trim_start().strip_prefix(OPEN) else {
-        return output;
-    };
-    match rest.find(CLOSE) {
-        Some(end) => rest[end + CLOSE.len()..].trim_start().to_owned(),
-        None => String::new(),
+    if let Some(rest) = output.trim_start().strip_prefix(OPEN) {
+        return match rest.find(CLOSE) {
+            Some(end) => rest[end + CLOSE.len()..].trim_start().to_owned(),
+            None => String::new(),
+        };
     }
+    if thinking
+        && let Some(end) = output.find(CLOSE)
+    {
+        return output[end + CLOSE.len()..].trim_start().to_owned();
+    }
+    output
 }
 
 /// Which MTP decode path `LLM::new` selects.
@@ -746,7 +761,7 @@ impl LLMContext<'_>{
     /// Decode a prompt and return the cleaned text with the number of generated
     /// token IDs, excluding the end-of-generation token (RD-18). `grammar`
     /// constrains the decode when present (PH-4a).
-    pub fn process(&mut self, tokens_list: Vec<LlamaToken>, grammar: Option<&str>, cancel: Option<&AtomicBool>) -> Result<(String, u32)>{
+    pub fn process(&mut self, tokens_list: Vec<LlamaToken>, grammar: Option<&str>, cancel: Option<&AtomicBool>, thinking: bool) -> Result<(String, u32)>{
         // let ctx_size: i32 = tokens_list.len() as i32 * 3;
         
         // We use this object to submit token data for decoding
@@ -800,7 +815,7 @@ impl LLMContext<'_>{
             self.ctx.decode(&mut batch).with_context(|| "Failed to eval")?;
         }
 
-        clean_output(output).map(|text| (text, usage.output_tokens))
+        clean_output(output, thinking).map(|text| (text, usage.output_tokens))
     }
 }
 
@@ -850,40 +865,99 @@ mod tests {
     #[test]
     fn removes_gemma_thinking_output() {
         assert_eq!(
-            clean_output("<|channel>thought\nreason<channel|>answer".into()).unwrap(),
+            clean_output("<|channel>thought\nreason<channel|>answer".into(), false).unwrap(),
             "answer"
         );
         assert_eq!(
-            clean_output("<|channel>thought answer<end_of_turn>".into()).unwrap(),
+            clean_output("<|channel>thought answer<end_of_turn>".into(), false).unwrap(),
             "answer"
         );
     }
 
-    /// `RD-28`, `SP-NEVER-003`: the reasoning trace never reaches the text.
+    /// `RD-28`, `SP-NEVER-003`, preserved behavior (AC-6): the reasoning trace
+    /// never reaches the text.
     #[test]
     fn removes_a_leading_thinking_block() {
         assert_eq!(
-            clean_output("<think>\nreasoning here\n</think>\nThe answer.".into()).unwrap(),
+            clean_output("<think>\nreasoning here\n</think>\nThe answer.".into(), false).unwrap(),
             "The answer."
         );
         assert_eq!(
-            clean_output("<think>reasoning</think>Answer".into()).unwrap(),
+            clean_output("<think>reasoning</think>Answer".into(), false).unwrap(),
             "Answer"
         );
     }
 
     /// An unterminated block leaves no answer behind, which is an error rather
-    /// than a trace in the response text.
+    /// than a trace in the response text (AC-7).
     #[test]
     fn rejects_output_that_is_only_a_thinking_block() {
-        assert!(clean_output("<think>reasoning without an end".into()).is_err());
+        assert!(clean_output("<think>reasoning without an end".into(), false).is_err());
     }
 
     /// `RD-28`, preserved behavior: an output with no thinking block is
-    /// returned unchanged.
+    /// returned unchanged (AC-8).
     #[test]
     fn keeps_output_without_a_thinking_block() {
-        assert_eq!(clean_output("plain answer".into()).unwrap(), "plain answer");
+        assert_eq!(
+            clean_output("plain answer".into(), false).unwrap(),
+            "plain answer"
+        );
+    }
+
+    /// AC-1: a template that opens the thinking block in its generation prompt
+    /// leaves the marker in the prompt, so the trace arrives with no leading
+    /// `<think>` and ends at a bare `</think>`.
+    #[test]
+    fn ac1_strips_a_trace_ended_by_a_bare_close_marker() {
+        assert_eq!(
+            clean_output("The user asks X.\n</think>\n\nOK".into(), true).unwrap(),
+            "OK"
+        );
+    }
+
+    /// AC-2: a trace that is empty is a leading close marker.
+    #[test]
+    fn ac2_strips_a_leading_close_marker() {
+        assert_eq!(clean_output("</think>\n\nOK".into(), true).unwrap(), "OK");
+    }
+
+    /// AC-3: a response that carries only a trace is an error, exactly as for
+    /// the leading `<think>` form (AC-7).
+    #[test]
+    fn ac3_rejects_output_that_is_only_a_trace() {
+        assert!(clean_output("reasoning\n</think>".into(), true).is_err());
+    }
+
+    /// AC-4: the first close marker ends the trace, so a later one is text.
+    #[test]
+    fn ac4_strips_only_through_the_first_close_marker() {
+        assert_eq!(
+            clean_output("trace</think>answer</think>more".into(), true).unwrap(),
+            "answer</think>more"
+        );
+    }
+
+    /// AC-5: a request that did not ask for thinking gets a closed block from
+    /// the template, so a close marker in the output is answer text.
+    #[test]
+    fn ac5_keeps_a_close_marker_when_thinking_was_not_requested() {
+        assert_eq!(
+            clean_output("text </think> more".into(), false).unwrap(),
+            "text </think> more"
+        );
+    }
+
+    /// AC-6: the leading `<think>...</think>` form is stripped under both
+    /// values, so gating the bare-marker rule does not change it.
+    #[test]
+    fn ac6_strips_a_leading_block_for_both_values() {
+        for thinking in [false, true] {
+            assert_eq!(
+                clean_output("<think>\nreasoning\n</think>\nAnswer.".into(), thinking).unwrap(),
+                "Answer."
+            );
+        }
     }
 
     /// `RD-28`: the effort reaches the template as JSON text, and an absent
