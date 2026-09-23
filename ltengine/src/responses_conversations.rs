@@ -396,7 +396,7 @@ mod tests {
     }
 
     fn args(extra: &[&str]) -> Args {
-        let mut argv = vec!["ltengine", "--api-key", "secret"];
+        let mut argv = vec!["ltengine", "--api-key", "secret", "--responses-api", "open-responses"];
         argv.extend_from_slice(extra);
         Args::parse_from(argv)
     }

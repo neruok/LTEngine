@@ -23,6 +23,7 @@ mod responses_http;
 mod responses_input;
 mod responses_limits;
 mod responses_metadata;
+mod responses_profile;
 mod responses_reasoning;
 mod responses_retrieve;
 mod responses_schema;
@@ -95,7 +96,11 @@ struct Args {
 
     /// Maximum number of stored responses (0 disables the limit)
     #[arg(long, default_value_t = 1000)]
-    max_stored_responses: usize
+    max_stored_responses: usize,
+
+    /// Responses API compatibility profile (RD-40). Required; no default.
+    #[arg(long = "responses-api", value_enum)]
+    responses_api: responses_profile::ResponsesApi
 }
 
 #[derive(Debug, Deserialize, Serialize)]

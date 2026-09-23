@@ -12,6 +12,7 @@
 use serde::Deserialize;
 
 use crate::llm::Reasoning;
+use crate::responses_profile::ResponsesApi;
 
 /// The `reasoning.effort` values of the pinned SDKs (`RD-8`).
 pub const EFFORT_VALUES: [&str; 7] =
@@ -59,6 +60,7 @@ impl ReasoningEffect {
 /// field, so the handler can return the OpenAI-shaped 400 (`SP-MUST-011`).
 pub fn derive_reasoning(
     reasoning: Option<&ResponseReasoning>,
+    profile: ResponsesApi,
 ) -> Result<ReasoningEffect, String> {
     let Some(reasoning) = reasoning else {
         // An absent object keeps the behavior that predates `RD-28`, which is
@@ -68,7 +70,7 @@ pub fn derive_reasoning(
     reject_unimplemented(reasoning)?;
     let effort = match reasoning.effort.as_ref() {
         None => None,
-        Some(value) => Some(validate_effort(value)?),
+        Some(value) => Some(profile.map_effort(&validate_effort(value)?)),
     };
     let thinking = effort.as_deref() != Some("none");
     Ok(ReasoningEffect { thinking, effort })
@@ -108,8 +110,17 @@ fn validate_effort(value: &serde_json::Value) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{EFFORT_VALUES, ResponseReasoning, derive_reasoning};
+    use super::{EFFORT_VALUES, ResponseReasoning};
+    use crate::responses_profile::ResponsesApi;
     use serde_json::json;
+
+    /// The pre-`RD-40` call shape: every pre-existing check runs under the
+    /// primary `open-responses` profile.
+    fn derive_reasoning(
+        reasoning: Option<&ResponseReasoning>,
+    ) -> Result<super::ReasoningEffect, String> {
+        super::derive_reasoning(reasoning, ResponsesApi::OpenResponses)
+    }
 
     fn parse(value: serde_json::Value) -> Option<ResponseReasoning> {
         serde_json::from_value(value).ok()
@@ -142,6 +153,24 @@ mod tests {
             let effect = derive_reasoning(Some(&reasoning)).expect("effort is valid");
             assert_eq!(effect.effort.as_deref(), Some(effort));
             assert_eq!(effect.thinking, effort != "none", "effort {effort}");
+        }
+    }
+
+    /// `PH8-29`: under `deepseek`, an accepted value is mapped to the value the
+    /// template receives (`RD-40` row 3).
+    #[test]
+    fn ph8_29_deepseek_maps_the_effort_value() {
+        for (requested, expected) in [
+            ("minimal", "low"),
+            ("medium", "high"),
+            ("xhigh", "high"),
+            ("low", "low"),
+            ("none", "none"),
+        ] {
+            let reasoning = parse(json!({ "effort": requested })).expect("parses");
+            let effect = super::derive_reasoning(Some(&reasoning), ResponsesApi::Deepseek)
+                .expect("accepted");
+            assert_eq!(effect.effort.as_deref(), Some(expected), "{requested}");
         }
     }
 

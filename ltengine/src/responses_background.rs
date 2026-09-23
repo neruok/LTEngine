@@ -490,6 +490,8 @@ mod tests {
                         "ltengine",
                         "--api-key",
                         "secret",
+                        "--responses-api",
+                        "open-responses",
                     ]))))
                     .app_data(web::Data::new($store))
                     .app_data(web::Data::new($registry))

@@ -231,6 +231,8 @@ mod tests {
                         $key,
                         "--retention-secs",
                         "0",
+                        "--responses-api",
+                        "open-responses",
                     ]))))
                     .app_data(web::Data::new($store))
                     .service(get_response)

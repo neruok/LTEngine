@@ -40,15 +40,46 @@ fn parse(json: &str) -> CreateRequest {
     serde_json::from_str(json).expect("request should parse")
 }
 
+/// The pre-`RD-40` call shape: the pre-existing checks run under the primary
+/// `open-responses` profile. New profile checks call `validate_request`
+/// directly with the profile they exercise.
+fn validate(request: &CreateRequest, loaded_model: &str) -> Result<PreparedPrompt, (u16, String)> {
+    validate_request(
+        request,
+        loaded_model,
+        crate::responses_profile::ResponsesApi::OpenResponses,
+    )
+}
+
+/// The pre-`RD-40` call shape for the credential checks.
+fn parse_and_authorize(
+    body: &[u8],
+    api_key: &str,
+    authorization: Option<&str>,
+) -> Result<CreateRequest, (u16, String)> {
+    super::parse_and_authorize(
+        body,
+        api_key,
+        authorization,
+        crate::responses_profile::ResponsesApi::OpenResponses,
+    )
+}
+
 #[test]
 fn model_identity_uses_named_builtin_model() {
-    let args = Args::parse_from(["ltengine", "--model", "gemma3-1b"]);
+    let args = Args::parse_from(["ltengine", "--responses-api", "open-responses", "--model", "gemma3-1b"]);
     assert_eq!(loaded_model_identifier(&args), "gemma3-1b");
 }
 
 #[test]
 fn model_identity_uses_model_file_override() {
-    let args = Args::parse_from(["ltengine", "--model-file", "/models/custom.gguf"]);
+    let args = Args::parse_from([
+        "ltengine",
+        "--responses-api",
+        "open-responses",
+        "--model-file",
+        "/models/custom.gguf",
+    ]);
     let loaded = loaded_model_identifier(&args);
     assert_eq!(loaded, "/models/custom.gguf");
     // The unrelated `--model` default must be rejected, the override accepted.
@@ -619,6 +650,89 @@ fn ph8_11_absent_verbosity_keeps_the_prompt() {
     let (expected, _) = map_input(None, &request.input).expect("input maps");
     let system = validate(&request, "gemma3-4b").expect("accepted").system;
     assert_eq!(system, expected);
+}
+
+/// `PH8-23`, changed behavior: `--responses-api` is required, and a server
+/// start without it fails with a message that names the option.
+#[test]
+fn ph8_23_responses_api_is_required() {
+    let err = Args::try_parse_from(["ltengine"]).unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("--responses-api"), "{text}");
+}
+
+/// `PH8-24`, changed behavior: the option accepts the three profiles and
+/// rejects any other value.
+#[test]
+fn ph8_24_responses_api_accepts_the_three_profiles() {
+    use crate::responses_profile::ResponsesApi;
+    for (value, expected) in [
+        ("openai", ResponsesApi::Openai),
+        ("deepseek", ResponsesApi::Deepseek),
+        ("open-responses", ResponsesApi::OpenResponses),
+    ] {
+        let args = Args::try_parse_from(["ltengine", "--responses-api", value])
+            .expect("a known profile parses");
+        assert_eq!(args.responses_api, expected);
+    }
+    assert!(Args::try_parse_from(["ltengine", "--responses-api", "bogus"]).is_err());
+}
+
+/// `PH8-25` and `PH8-27`, changed behavior: `openai` and `open-responses`
+/// reject an unsupported request field with HTTP 400 that names it.
+#[test]
+fn ph8_25_27_unsupported_field_is_rejected_by_name() {
+    use crate::responses_profile::ResponsesApi;
+    for profile in [ResponsesApi::Openai, ResponsesApi::OpenResponses] {
+        let (status, message) =
+            super::parse_body(br#"{"input":"hi","bogus":1}"#, profile).unwrap_err();
+        assert_eq!(status, 400, "{profile:?}");
+        assert!(message.contains("bogus"), "{profile:?}: {message}");
+    }
+}
+
+/// `PH8-26`, changed behavior: `deepseek` ignores an unsupported request field
+/// and the request succeeds.
+#[test]
+fn ph8_26_deepseek_ignores_an_unsupported_field() {
+    use crate::responses_profile::ResponsesApi;
+    let request = super::parse_body(br#"{"input":"hi","bogus":1}"#, ResponsesApi::Deepseek)
+        .expect("the field is ignored");
+    assert!(matches!(request.input, ResponseInput::Text(_)), "input parsed");
+}
+
+/// `PH8-28`, preserved behavior: an unsupported tool and an unsupported
+/// modality are HTTP 400 in every profile.
+#[test]
+fn ph8_28_unsupported_tool_and_modality_are_400_in_every_profile() {
+    use crate::responses_profile::ResponsesApi;
+    for profile in [
+        ResponsesApi::Openai,
+        ResponsesApi::Deepseek,
+        ResponsesApi::OpenResponses,
+    ] {
+        let tool = parse(r#"{"input":"hi","tools":[{"type":"function","name":"f"}]}"#);
+        let (status, _) = validate_request(&tool, "gemma3-4b", profile).unwrap_err();
+        assert_eq!(status, 400, "tool {profile:?}");
+
+        let modality = parse(
+            r#"{"input":[{"role":"user","content":[{"type":"input_image","image_url":"x"}]}]}"#,
+        );
+        let (status, _) = validate_request(&modality, "gemma3-4b", profile).unwrap_err();
+        assert_eq!(status, 400, "modality {profile:?}");
+    }
+}
+
+/// `PH8-29`, changed behavior: `deepseek` accepts `text.verbosity` with no
+/// effect, while the effective value is still the request's value.
+#[test]
+fn ph8_29_deepseek_accepts_verbosity_without_the_directive() {
+    use crate::responses_profile::ResponsesApi;
+    let request = parse(r#"{"input":"hi","text":{"verbosity":"high"}}"#);
+    let prepared = validate_request(&request, "gemma3-4b", ResponsesApi::Deepseek)
+        .expect("deepseek accepts the field");
+    assert!(!prepared.system.contains("Be thorough."), "{}", prepared.system);
+    assert_eq!(prepared.verbosity, Verbosity::High);
 }
 
 /// `PH8-12`, changed behavior: the response echoes the effective verbosity only

@@ -30,6 +30,7 @@ use crate::responses_input::{
     ResponseInput, input_items, map_input, output_items_as_input, parse_input_items,
     stored_items_as_input,
 };
+use crate::responses_profile::ResponsesApi;
 use crate::responses_reasoning::{ReasoningEffect, ResponseReasoning, derive_reasoning};
 use crate::responses_schema::{ResponseTextConfig, StructuredFormat, Verbosity, derive_text};
 use crate::responses_shape::{
@@ -154,6 +155,9 @@ struct PreparedPrompt {
     generation_echo: GenerationEcho,
     /// The effective `text.verbosity` (`RD-30`).
     verbosity: Verbosity,
+    /// The directive to append, or `None` when the profile or the value adds
+    /// none (`RD-30`, `RD-40` row 4).
+    verbosity_directive: Option<&'static str>,
 }
 
 /// Validate every supported-statefulness and model choice before generation.
@@ -161,7 +165,11 @@ struct PreparedPrompt {
 /// `stream` is not validated here: `stream: true` selects the SSE response of
 /// `build_stream_body` (RD-17). Every rejection below happens before the first
 /// event, so it uses the normal OpenAI-shaped HTTP error (RD-13).
-fn validate(request: &CreateRequest, loaded_model: &str) -> Result<PreparedPrompt, (u16, String)> {
+fn validate_request(
+    request: &CreateRequest,
+    loaded_model: &str,
+    profile: ResponsesApi,
+) -> Result<PreparedPrompt, (u16, String)> {
     if let Some(model) = &request.model {
         if model != loaded_model {
             return Err((
@@ -200,9 +208,17 @@ fn validate(request: &CreateRequest, loaded_model: &str) -> Result<PreparedPromp
     )
     .map_err(|message| (400, message))?;
     let text = derive_text(request.text.as_ref()).map_err(|message| (400, message))?;
-    let generation = derive_generation(request).map_err(|message| (400, message))?;
-    let reasoning =
-        derive_reasoning(request.reasoning.as_ref()).map_err(|message| (400, message))?;
+    let requested = derive_generation(request).map_err(|message| (400, message))?;
+    let reasoning = derive_reasoning(request.reasoning.as_ref(), profile)
+        .map_err(|message| (400, message))?;
+    // The profile may adjust the sampler values (`RD-40` row 5). The echo stays
+    // the requested numbers (`RD-29` 3.4).
+    let generation = profile.sampling(reasoning.thinking, requested.generation);
+    let verbosity_directive = if profile.applies_verbosity_directive() {
+        text.verbosity.directive()
+    } else {
+        None
+    };
     if tools.offers_tools() && text.format.json_required {
         // Combining the tool envelope with a structured output format needs two
         // grammars. The route does not implement the combination, so it
@@ -220,9 +236,10 @@ fn validate(request: &CreateRequest, loaded_model: &str) -> Result<PreparedPromp
         format: text.format,
         tools,
         reasoning,
-        generation: generation.generation,
-        generation_echo: generation.echo,
+        generation,
+        generation_echo: requested.echo,
         verbosity: text.verbosity,
+        verbosity_directive,
     };
     append_system_notes(&mut system, &prepared);
     Ok(PreparedPrompt { system, ..prepared })
@@ -302,7 +319,7 @@ fn append_system_notes(system: &mut String, prepared: &PreparedPrompt) {
     if let Some(note) = prepared.tools.system_note() {
         push_system_note(system, &note);
     }
-    if let Some(directive) = prepared.verbosity.directive() {
+    if let Some(directive) = prepared.verbosity_directive {
         push_system_note(system, directive);
     }
 }
@@ -377,13 +394,73 @@ fn maybe_store(
 /// Parse the body before the credential check. This order is RD-4: a request
 /// that carries the body field `api_key` is a 400 even when `Authorization` is
 /// absent or wrong, never a 401.
+/// The top-level request fields the route implements. An unsupported field is
+/// a request error, except under the `deepseek` profile (`RD-41`).
+const KNOWN_FIELDS: [&str; 18] = [
+    "model",
+    "instructions",
+    "input",
+    "stream",
+    "metadata",
+    "text",
+    "api_key",
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
+    "store",
+    "previous_response_id",
+    "conversation",
+    "reasoning",
+    "background",
+    "temperature",
+    "top_p",
+    "max_output_tokens",
+];
+
+/// Decode the body. An unsupported top-level field is an HTTP 400 that names it
+/// (`RD-40` row 8), except under the `deepseek` profile, which drops it and
+/// logs its name (`RD-41`).
+fn parse_body(body: &[u8], profile: ResponsesApi) -> Result<CreateRequest, (u16, String)> {
+    let value: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|err| (400, format!("invalid request body: {}", err)))?;
+    let Some(object) = value.as_object() else {
+        return Err((
+            400,
+            "invalid request body: expected a JSON object".to_string(),
+        ));
+    };
+    let unknown: Vec<&String> = object
+        .keys()
+        .filter(|key| !KNOWN_FIELDS.contains(&key.as_str()))
+        .collect();
+    if unknown.is_empty() {
+        return serde_json::from_value(value)
+            .map_err(|err| (400, format!("invalid request body: {}", err)));
+    }
+    if !profile.ignores_unsupported_fields() {
+        let field = unknown[0];
+        return Err((400, format!("unknown field `{field}`")));
+    }
+    for field in &unknown {
+        eprintln!(
+            "ltengine: `deepseek` profile ignored the unsupported request field `{field}`"
+        );
+    }
+    let mut cleaned = object.clone();
+    for field in &unknown {
+        cleaned.remove(*field);
+    }
+    serde_json::from_value(serde_json::Value::Object(cleaned))
+        .map_err(|err| (400, format!("invalid request body: {}", err)))
+}
+
 fn parse_and_authorize(
     body: &[u8],
     api_key: &str,
     authorization: Option<&str>,
+    profile: ResponsesApi,
 ) -> Result<CreateRequest, (u16, String)> {
-    let request: CreateRequest = serde_json::from_slice(body)
-        .map_err(|err| (400, format!("invalid request body: {}", err)))?;
+    let request = parse_body(body, profile)?;
     if request.api_key.is_some() {
         return Err((
             400,
@@ -411,13 +488,18 @@ pub async fn create_response(
         Err(err) => return extractor_error(err),
     };
 
-    let request = match parse_and_authorize(&body, &args.api_key, authorization) {
+    let request = match parse_and_authorize(
+        &body,
+        &args.api_key,
+        authorization,
+        args.responses_api,
+    ) {
         Ok(request) => request,
         Err((status, message)) => return error_json(status, message),
     };
 
     let loaded_model = loaded_model_identifier(&args);
-    let prepared = match validate(&request, &loaded_model) {
+    let prepared = match validate_request(&request, &loaded_model, args.responses_api) {
         Ok(prepared) => prepared,
         Err((status, message)) => return error_json(status, message),
     };
