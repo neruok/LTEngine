@@ -2,7 +2,7 @@
 //!
 //! `text.format` follows the OpenAI Responses API contract. `strict: true`
 //! selects constrained decoding: the schema becomes a GBNF grammar through
-//! `llama_cpp_2::json_schema_to_grammar`, and the sampler is constrained with
+//! `llama_cpp_common::json_schema_to_grammar`, and the sampler is constrained with
 //! it. No second decode path and no new dependency (`CC-3`, `CC-4`).
 //!
 //! `PH-4a` emits no `refusal` content part. A refusal is model behavior and
@@ -73,7 +73,7 @@ pub fn derive_format(text: Option<&ResponseTextConfig>) -> Result<StructuredForm
             reject_schema_members(format, "json_object")?;
             // The OpenAI contract guarantees valid JSON in JSON mode, so the
             // decode is constrained to any JSON value, not just best effort.
-            let grammar = llama_cpp_2::json_schema_to_grammar(r#"{"type":"object"}"#)
+            let grammar = llama_cpp_common::json_schema_to_grammar(r#"{"type":"object"}"#)
                 .map_err(|err| format!("`text.format.type` `json_object` failed: {err}"))?;
             Ok(StructuredFormat {
                 json_required: true,
@@ -116,7 +116,7 @@ fn decode_json_schema(format: &TextFormat) -> Result<StructuredFormat, String> {
     }
     let grammar = if format.strict.unwrap_or(false) {
         Some(
-            llama_cpp_2::json_schema_to_grammar(&schema.to_string()).map_err(|err| {
+            llama_cpp_common::json_schema_to_grammar(&schema.to_string()).map_err(|err| {
                 format!("`text.format.schema` is not a supported JSON schema: {err}")
             })?,
         )

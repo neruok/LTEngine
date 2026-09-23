@@ -1,13 +1,14 @@
 use llama_cpp_2::context::params::{LlamaContextParams, LlamaContextType};
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaModel, LlamaChatMessage};
-use llama_cpp_2::chat::LlamaMinjaChatTemplate;
+use llama_cpp_2::model::{LlamaModel, LlamaChatMessage};
+use llama_cpp_2::vocab::LlamaVocab;
+use llama_cpp_common::chat::LlamaMinjaChatTemplate;
 use llama_cpp_2::token::LlamaToken;
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::sampling::LlamaSampler;
-use llama_cpp_2::speculative::{MtpSpeculative, MtpSpeculativeParams};
+use llama_cpp_common::speculative::{MtpSpeculative, MtpSpeculativeParams};
 use llama_cpp_2::{send_logs_to_tracing, LogOptions};
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -356,11 +357,10 @@ impl LLM {
 
         // llama.cpp strips a leading BOS from the rendered text whenever the
         // vocabulary enables add_bos (common/chat.cpp), so the rendered prompt
-        // cannot be assumed to carry one. AddBos::Always maps to
-        // add_special=true and lets the vocabulary decide.
-        let tokens_list = self.model
-            .str_to_token(&llm_input, AddBos::Always)
-            .with_context(|| "Failed to tokenize prompt")?;
+        // cannot be assumed to carry one. `add_special = true` lets the
+        // vocabulary decide, and `parse_special = true` keeps the template's
+        // special tokens as tokens.
+        let tokens_list = self.model.vocab().tokenize(llm_input.as_bytes(), true, true);
         // for token in &tokens_list {
         //     eprint!("{} {} | ", self.model.token_to_str(*token, Special::Tokenize)?, token);
         // }
@@ -465,12 +465,12 @@ impl LLM {
             if is_cancelled(cancel) {
                 return Err(LLMError::Cancelled.into());
             }
-            if self.model.is_eog_token(token) {
+            if self.model.vocab().is_eog(token) {
                 break;
             }
             // The check above excluded the end-of-generation token.
             usage.record_output(false);
-            append_token(&self.model, token, &mut decoder, &mut output)?;
+            append_token(&self.model.vocab(), token, &mut decoder, &mut output)?;
 
             let mut drafts = mtp.draft(n_past, token, &tokens_list)
                 .context("MTP draft failed")?;
@@ -503,7 +503,7 @@ impl LLM {
                     break;
                 }
                 accepted = i + 1;
-                if self.model.is_eog_token(next) {
+                if self.model.vocab().is_eog(next) {
                     break;
                 }
                 next = sampler.sample(mtp.target_context(), i32::try_from(i + 1)?);
@@ -525,10 +525,10 @@ impl LLM {
             }
 
             for draft_token in drafts.iter().copied().take(accepted) {
-                append_token(&self.model, draft_token, &mut decoder, &mut output)?;
+                append_token(&self.model.vocab(), draft_token, &mut decoder, &mut output)?;
                 // An accepted draft counts, unless it is the end-of-generation
                 // token, which is never counted (RD-18).
-                usage.record_output(self.model.is_eog_token(draft_token));
+                usage.record_output(self.model.vocab().is_eog(draft_token));
             }
             accepted_total += accepted;
             token = next;
@@ -569,9 +569,11 @@ fn load_mtp_model(
 }
 
 fn validate_mtp_pair(target: &LlamaModel, draft: &LlamaModel) -> Result<()> {
+    let target_vocab = target.vocab();
+    let draft_vocab = draft.vocab();
     if target.n_vocab() != draft.n_vocab()
-        || target.vocab_type() != draft.vocab_type()
-        || target.token_bos() != draft.token_bos()
+        || target_vocab.vocab_type() != draft_vocab.vocab_type()
+        || target_vocab.bos() != draft_vocab.bos()
         || target.n_embd_out() != draft.n_embd_out()
     {
         anyhow::bail!(
@@ -579,10 +581,10 @@ fn validate_mtp_pair(target: &LlamaModel, draft: &LlamaModel) -> Result<()> {
              vocab={}/{}, type={:?}/{:?}, BOS={:?}/{:?}, embedding={}/{}",
             target.n_vocab(),
             draft.n_vocab(),
-            target.vocab_type(),
-            draft.vocab_type(),
-            target.token_bos(),
-            draft.token_bos(),
+            target_vocab.vocab_type(),
+            draft_vocab.vocab_type(),
+            target_vocab.bos(),
+            draft_vocab.bos(),
             target.n_embd_out(),
             draft.n_embd_out(),
         );
@@ -649,15 +651,33 @@ fn create_sampler(model: &LlamaModel, grammar: Option<&str>) -> Result<LlamaSamp
 }
 
 fn append_token(
-    model: &LlamaModel,
+    vocab: &LlamaVocab<'_>,
     token: LlamaToken,
     decoder: &mut encoding_rs::Decoder,
     output: &mut String,
 ) -> Result<()> {
-    if !model.is_eog_token(token) {
-        output.push_str(&model.token_to_piece(token, decoder, true, None)?);
+    if !vocab.is_eog(token) {
+        output.push_str(&decode_piece(decoder, &vocab.token_to_piece(token, true, None)));
     }
     Ok(())
+}
+
+/// Decode one token's bytes with the incremental UTF-8 decoder.
+///
+/// `decode_to_string` never grows its destination. The decoder's bound also
+/// accounts for an incomplete UTF-8 sequence retained from the previous token.
+fn decode_piece(decoder: &mut encoding_rs::Decoder, bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(
+        decoder
+            .max_utf8_buffer_length(bytes.len())
+            .expect("token output is too large to decode"),
+    );
+    let (result, read, _) = decoder.decode_to_string(bytes, &mut output, false);
+    assert!(
+        matches!(result, encoding_rs::CoderResult::InputEmpty) && read == bytes.len(),
+        "UTF-8 decoder capacity bound must consume the complete token"
+    );
+    output
 }
 
 fn clean_output(output: String, thinking: bool) -> Result<String> {
@@ -798,13 +818,13 @@ impl LLMContext<'_>{
                 // so the loop must not accept it a second time. A second accept
                 // advances a grammar past its end and exhausts it (PH-4a).
                 // is it an end of stream?
-                if self.llm.model.is_eog_token(token) {
+                if self.llm.model.vocab().is_eog(token) {
                     break;
                 }
 
                 // RD-18: count the generated token, end-of-generation excluded.
                 usage.record_output(false);
-                append_token(&self.llm.model, token, &mut decoder, &mut output)?;
+                append_token(&self.llm.model.vocab(), token, &mut decoder, &mut output)?;
 
                 batch.clear();
                 batch.add(token, n_cur, &[0], true)?;

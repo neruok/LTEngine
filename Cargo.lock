@@ -1245,10 +1245,9 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 
 [[package]]
 name = "llama-cpp-2"
-version = "0.1.157"
-source = "git+https://github.com/neruok/llama-cpp-rs?rev=262eab2cb2633e8263716441dd0cdcb839c8177f#262eab2cb2633e8263716441dd0cdcb839c8177f"
+version = "0.1.158"
+source = "git+https://github.com/neruok/llama-cpp-rs?rev=51277d0c19e4546eac660bd933a4547fddba01a9#51277d0c19e4546eac660bd933a4547fddba01a9"
 dependencies = [
- "encoding_rs",
  "enumflags2",
  "llama-cpp-sys-2",
  "thiserror 2.0.20",
@@ -1257,9 +1256,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "llama-cpp-common"
+version = "0.1.0"
+source = "git+https://github.com/neruok/llama-cpp-common?rev=6627f3dd9b1b2f4f18e26d1765af6fb65ffc760e#6627f3dd9b1b2f4f18e26d1765af6fb65ffc760e"
+dependencies = [
+ "cc",
+ "llama-cpp-2",
+ "llama-cpp-sys-2",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "llama-cpp-sys-2"
-version = "0.1.157"
-source = "git+https://github.com/neruok/llama-cpp-rs?rev=262eab2cb2633e8263716441dd0cdcb839c8177f#262eab2cb2633e8263716441dd0cdcb839c8177f"
+version = "0.1.158"
+source = "git+https://github.com/neruok/llama-cpp-rs?rev=51277d0c19e4546eac660bd933a4547fddba01a9#51277d0c19e4546eac660bd933a4547fddba01a9"
 dependencies = [
  "bindgen",
  "cc",
@@ -1313,6 +1323,7 @@ dependencies = [
  "encoding_rs",
  "hf-hub",
  "llama-cpp-2",
+ "llama-cpp-common",
  "once_cell",
  "parking_lot",
  "serde",

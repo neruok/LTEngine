@@ -212,7 +212,7 @@ pub fn parse_tools(
     let grammar = match envelope_schema(&pending, request.parallel_tool_calls, &request.choice)
         .ok_or_else(|| "`tools` cannot form a grammar".to_string())
         .and_then(|schema| {
-            llama_cpp_2::json_schema_to_grammar(&schema.to_string())
+            llama_cpp_common::json_schema_to_grammar(&schema.to_string())
                 .map_err(|err| format!("`tools` schema is not a supported JSON schema: {err}"))
         }) {
         Ok(grammar) => Some(grammar),
