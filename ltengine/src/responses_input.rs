@@ -5,6 +5,11 @@
 //! tool template on this route, so the mapping folds both tool items into the
 //! prompt text.
 //!
+//! Since `PH-8b` (`RD-39`), an `input` array also accepts a `reasoning` item.
+//! Its plain-text `content` parts fold into the prompt text, so a client can
+//! round-trip a verbatim trace. Its `summary` and `encrypted_content` members
+//! are accepted and not merged.
+//!
 //! `PH-5` also normalizes an input to JSON items for storage and listing
 //! (`input_items`), converts a stored `output` array back to input items for
 //! `previous_response_id` (`output_items_as_input`), and rebuilds the typed
@@ -29,6 +34,7 @@ pub enum InputItem {
     Message(Message),
     FunctionCall(FunctionCallItem),
     FunctionCallOutput(FunctionCallOutputItem),
+    Reasoning(ReasoningItem),
 }
 
 /// An assistant tool call sent back as input. The route folds it into the
@@ -65,6 +71,28 @@ pub struct FunctionCallOutputItem {
     pub call_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<serde_json::Value>,
+}
+
+/// An input `reasoning` item (`RD-39`). Only the plain-text `content` parts
+/// reach the prompt; `summary` and `encrypted_content` are accepted so a client
+/// can echo a response item back unchanged. `id` and `status` exist for the
+/// same reason.
+#[allow(dead_code)]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReasoningItem {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<Vec<ContentPart>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted_content: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -198,6 +226,9 @@ fn stored_item_as_input(item: &serde_json::Value) -> Option<serde_json::Value> {
             "call_id": item.get("call_id")?,
             "output": item.get("output").cloned().unwrap_or(serde_json::Value::Null),
         })),
+        // A stored reasoning item keeps its shape, so `previous_response_id`
+        // and a conversation round-trip the trace (`RD-39`).
+        Some("reasoning") => Some(item.clone()),
         _ => None,
     }
 }
@@ -257,12 +288,45 @@ pub fn map_input(
                         };
                         user.push(format!("Tool result for `{}`: {}", output.call_id, text));
                     }
+                    InputItem::Reasoning(reasoning) => {
+                        // `RD-39`: the plain-text content merges into the
+                        // prompt at this position. `summary` does not.
+                        let text = reasoning_text(reasoning)?;
+                        if !text.is_empty() {
+                            user.push(text);
+                        }
+                    }
                 }
             }
         }
     }
 
     Ok((system.join("\n"), user.join("\n")))
+}
+
+/// The plain-text `content` of an input reasoning item (`RD-39`). A part type
+/// other than `reasoning_text` or `output_text` is a request error that names
+/// the type.
+fn reasoning_text(item: &ReasoningItem) -> Result<String, String> {
+    let Some(parts) = item.content.as_ref() else {
+        return Ok(String::new());
+    };
+    let mut texts = Vec::new();
+    for part in parts {
+        if part.kind != "reasoning_text" && part.kind != "output_text" {
+            return Err(format!("unsupported reasoning content type: {}", part.kind));
+        }
+        if let Some(field) = part.extra.keys().next() {
+            return Err(format!(
+                "unsupported reasoning content field `{field}` on content type {}",
+                part.kind
+            ));
+        }
+        if let Some(text) = part.text.as_ref() {
+            texts.push(text.clone());
+        }
+    }
+    Ok(texts.join("\n"))
 }
 
 fn message_text(message: &Message) -> Result<String, String> {

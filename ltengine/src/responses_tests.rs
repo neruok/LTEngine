@@ -468,6 +468,48 @@ fn rejects_other_unknown_fields() {
     assert!(serde_json::from_str::<CreateRequest>(r#"{"input":"hi","bogus":1}"#).is_err());
 }
 
+/// `PH8-32`, changed behavior: an input `reasoning` item is accepted and its
+/// plain-text `content` merges into the prompt. `summary` does not merge.
+#[test]
+fn ph8_32_reasoning_input_item_merges_its_content() {
+    let input: ResponseInput = serde_json::from_str(
+        r#"[{"role":"user","content":"question"},
+            {"type":"reasoning","id":"rs_1","status":"completed",
+             "summary":[{"type":"summary_text","text":"a summary"}],
+             "content":[{"type":"reasoning_text","text":"the trace"}],
+             "encrypted_content":null},
+            {"role":"assistant","content":"the answer"}]"#,
+    )
+    .expect("a reasoning item is accepted");
+    let (system, user) = map_input(None, &input).expect("input maps");
+    assert_eq!(system, "");
+    assert!(user.contains("the trace"), "{user}");
+    assert!(user.contains("the answer"), "{user}");
+    assert!(!user.contains("a summary"), "{user}");
+}
+
+/// `PH8-32`, changed behavior: the route body decoder accepts a reasoning
+/// item. This covers the `parse_body` path, which is the one the HTTP request
+/// uses.
+#[test]
+fn ph8_32_parse_body_accepts_a_reasoning_item() {
+    use crate::responses_profile::ResponsesApi;
+    let body = br#"{"input":[{"role":"user","content":"Say OK."},{"type":"reasoning","id":"rs_1","status":"completed","summary":[{"type":"summary_text","text":"a summary"}],"content":[{"type":"reasoning_text","text":"the trace"}],"encrypted_content":null},{"role":"assistant","content":"OK"}]}"#;
+    super::parse_body(body, ResponsesApi::OpenResponses).expect("the route decoder accepts it");
+}
+
+/// `PH8-32`, changed behavior: an unsupported reasoning content part type is a
+/// request error that names the type.
+#[test]
+fn ph8_32_rejects_an_unsupported_reasoning_content_part() {
+    let input: ResponseInput = serde_json::from_str(
+        r#"[{"type":"reasoning","content":[{"type":"input_image","image_url":"x"}]}]"#,
+    )
+    .expect("the reasoning item shape parses");
+    let err = map_input(None, &input).expect_err("unsupported part");
+    assert!(err.contains("input_image"), "{err}");
+}
+
 /// `PH8-01`, changed behavior: `temperature` is accepted in 0.0–2.0 and
 /// rejected outside it, naming the field.
 #[test]
