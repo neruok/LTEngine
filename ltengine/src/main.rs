@@ -18,6 +18,7 @@ mod prompt;
 mod responses;
 mod responses_background;
 mod responses_conversations;
+mod responses_generation;
 mod responses_http;
 mod responses_input;
 mod responses_limits;

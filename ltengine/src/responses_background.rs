@@ -18,7 +18,8 @@ use crate::llm::{self, TokenUsage};
 use crate::responses_http::{error_json, not_found, strict_guard};
 use crate::responses_reasoning::ReasoningEffect;
 use crate::responses_shape::{
-    build_response_object, calls_output, message_output, new_id, now_secs, usage_json,
+    ResponseControls, build_response_object, calls_output, message_output, new_id, now_secs,
+    usage_json,
 };
 use crate::responses_store::{AppStore, ConversationRecord, StoredResponse};
 use crate::responses_tools::{ModelTurn, ToolEcho, ToolRequest, parse_turn};
@@ -31,6 +32,7 @@ pub(crate) trait Generate: Send + Sync {
         user: String,
         grammar: Option<String>,
         reasoning: ReasoningEffect,
+        generation: llm::Generation,
         cancel: Arc<AtomicBool>,
     ) -> anyhow::Result<(String, TokenUsage)>;
 }
@@ -42,6 +44,7 @@ impl Generate for llm::LLM {
         user: String,
         grammar: Option<String>,
         reasoning: ReasoningEffect,
+        generation: llm::Generation,
         cancel: Arc<AtomicBool>,
     ) -> anyhow::Result<(String, TokenUsage)> {
         self.run_prompt_usage_grammar_cancellable(
@@ -50,6 +53,7 @@ impl Generate for llm::LLM {
             grammar.as_deref(),
             Some(cancel.as_ref()),
             &reasoning.as_reasoning(),
+            &generation,
         )
     }
 }
@@ -109,6 +113,11 @@ pub(crate) struct BackgroundRequest {
     pub json_required: bool,
     /// The decoded `reasoning` request (`RD-28`).
     pub reasoning: ReasoningEffect,
+    /// The decoded generation controls (`RD-29`).
+    pub generation: llm::Generation,
+    /// The response echo of the generation controls and verbosity (`RD-29`,
+    /// `RD-30`).
+    pub controls: ResponseControls,
     pub system: String,
     pub user: String,
     pub input_items: Vec<Value>,
@@ -154,6 +163,7 @@ pub(crate) fn start(request: BackgroundRequest) -> HttpResponse {
         request.metadata.as_ref(),
         request.conversation.as_deref(),
         &request.echo,
+        &request.controls,
         json!([]),
         Value::Null,
     );
@@ -198,6 +208,7 @@ impl BackgroundJob {
             request.user.clone(),
             request.grammar.clone(),
             request.reasoning.clone(),
+            request.generation,
             Arc::clone(&cancel),
         );
         let completed = match result {
@@ -211,6 +222,7 @@ impl BackgroundJob {
                     request.metadata.as_ref(),
                     request.conversation.as_deref(),
                     &request.echo,
+                    &request.controls,
                     output,
                     usage_json(&usage),
                 ),
@@ -260,6 +272,7 @@ fn object_for(
         request.metadata.as_ref(),
         request.conversation.as_deref(),
         &request.echo,
+        &request.controls,
         output,
         Value::Null,
     )
@@ -355,6 +368,7 @@ mod tests {
             _user: String,
             _grammar: Option<String>,
             _reasoning: ReasoningEffect,
+            _generation: llm::Generation,
             cancel: Arc<AtomicBool>,
         ) -> anyhow::Result<(String, TokenUsage)> {
             match &self.behavior {
@@ -387,6 +401,8 @@ mod tests {
             grammar: None,
             json_required: false,
             reasoning: ReasoningEffect::default(),
+            generation: llm::Generation::default(),
+            controls: ResponseControls::default(),
             system: String::new(),
             user: "hi".to_string(),
             input_items: Vec::new(),

@@ -7,20 +7,100 @@
 //!
 //! `PH-4a` emits no `refusal` content part. A refusal is model behavior and
 //! stays outside the permanent limits (`SP-NEVER-001`).
+//!
+//! `text.verbosity` is a best-effort, LTEngine-defined prompt directive
+//! (`RD-30`). It is not OpenAI behavior, and a model can ignore it.
 
 use serde::Deserialize;
 
-/// OpenAI `text` request object. `verbosity` is part of the contract but not
-/// implemented; a present value is rejected rather than silently ignored
-/// (`SP-NEVER-010`).
+/// OpenAI `text` request object. `format` selects structured output;
+/// `verbosity` selects the `RD-30` prompt directive.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResponseTextConfig {
     #[serde(default)]
     pub format: Option<TextFormat>,
-    /// Accepted by the OpenAI contract, not implemented by this route.
+    /// OpenAI `text.verbosity`. A non-string or an unknown value is rejected
+    /// by `derive_text`, naming the field (`SP-NEVER-010`).
     #[serde(default)]
     pub verbosity: Option<serde_json::Value>,
+}
+
+/// OpenAI `text.verbosity` (`RD-30`). `medium` is the default and appends no
+/// directive.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Verbosity {
+    Low,
+    #[default]
+    Medium,
+    High,
+}
+
+impl Verbosity {
+    /// The accepted values, in the order an error message lists them.
+    pub const VALUES: [&'static str; 3] = ["low", "medium", "high"];
+
+    /// The request value of this verbosity.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+
+    /// The best-effort system directive of `RD-30` 4.2, or `None` for
+    /// `medium`.
+    pub fn directive(self) -> Option<&'static str> {
+        match self {
+            Self::Low => {
+                Some("Be concise. Give the shortest complete answer and omit explanation.")
+            }
+            Self::High => Some(
+                "Be thorough. Give a complete answer with explanation and supporting detail.",
+            ),
+            Self::Medium => None,
+        }
+    }
+
+    fn decode(value: &serde_json::Value) -> Result<Self, String> {
+        let Some(text) = value.as_str() else {
+            return Err(format!(
+                "`text.verbosity` must be one of {}",
+                Self::VALUES.join(", ")
+            ));
+        };
+        match text {
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            other => Err(format!(
+                "`text.verbosity` `{other}` is not supported; use {}",
+                Self::VALUES.join(", ")
+            )),
+        }
+    }
+}
+
+/// The decoded consequence of the `text` request object.
+#[derive(Debug, Default)]
+pub struct TextEffect {
+    /// The `text.format` effect (`PH-4a`).
+    pub format: StructuredFormat,
+    /// The effective `text.verbosity` (`RD-30`). `medium` when absent.
+    pub verbosity: Verbosity,
+}
+
+/// Decode the `text` request object into its format and verbosity effects. An
+/// error message names the rejected field, so the handler can return the
+/// OpenAI-shaped 400 (`SP-MUST-011`).
+pub fn derive_text(text: Option<&ResponseTextConfig>) -> Result<TextEffect, String> {
+    let verbosity = match text.and_then(|text| text.verbosity.as_ref()) {
+        None => Verbosity::Medium,
+        Some(value) => Verbosity::decode(value)?,
+    };
+    let format = derive_format(text)?;
+    Ok(TextEffect { format, verbosity })
 }
 
 /// OpenAI `text.format` object. `type` selects the format; `name`,
@@ -58,9 +138,6 @@ pub fn derive_format(text: Option<&ResponseTextConfig>) -> Result<StructuredForm
     let Some(text) = text else {
         return Ok(StructuredFormat::default());
     };
-    if text.verbosity.is_some() {
-        return Err("`text.verbosity` is not implemented on this route".to_string());
-    }
     let Some(format) = text.format.as_ref() else {
         return Ok(StructuredFormat::default());
     };

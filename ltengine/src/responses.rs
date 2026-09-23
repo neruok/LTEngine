@@ -25,15 +25,16 @@ use serde::Deserialize;
 use crate::Args;
 use crate::llm;
 use crate::responses_http::{bearer, check_auth, error_json, extractor_error, not_found};
+use crate::responses_generation::{GenerationEcho, derive_generation};
 use crate::responses_input::{
     ResponseInput, input_items, map_input, output_items_as_input, parse_input_items,
     stored_items_as_input,
 };
 use crate::responses_reasoning::{ReasoningEffect, ResponseReasoning, derive_reasoning};
-use crate::responses_schema::{derive_format, ResponseTextConfig, StructuredFormat};
+use crate::responses_schema::{ResponseTextConfig, StructuredFormat, Verbosity, derive_text};
 use crate::responses_shape::{
-    StreamOutput, build_response_with_conversation, build_stream_body_with_conversation,
-    calls_output, message_output,
+    ResponseControls, StreamOutput, build_response_with_conversation,
+    build_stream_body_with_conversation, calls_output, message_output,
 };
 use crate::responses_store::{AppStore, ConversationRecord, ResponseStore, StoredResponse};
 use crate::responses_tools::{ModelTurn, ToolEcho, ToolRequest, parse_tools, parse_turn};
@@ -111,6 +112,18 @@ pub struct CreateRequest {
     /// `stream: true`.
     #[serde(default)]
     pub background: Option<bool>,
+    /// OpenAI `temperature` (PH-8a, `RD-29`). A number in 0.0–2.0. Absent or
+    /// `null` keeps the greedy sampler.
+    #[serde(default)]
+    pub temperature: Option<serde_json::Value>,
+    /// OpenAI `top_p` (PH-8a, `RD-29`). A number in 0.0–1.0. Absent or `null`
+    /// keeps the current `0.95`.
+    #[serde(default)]
+    pub top_p: Option<serde_json::Value>,
+    /// OpenAI `max_output_tokens` (PH-8a, `RD-29`). An integer of at least 1.
+    /// Absent or `null` keeps the `3 × prompt` budget.
+    #[serde(default)]
+    pub max_output_tokens: Option<serde_json::Value>,
 }
 
 
@@ -135,6 +148,12 @@ struct PreparedPrompt {
     tools: ToolRequest,
     /// The decoded `reasoning` request (`RD-28`).
     reasoning: ReasoningEffect,
+    /// The decoded generation controls (`RD-29`).
+    generation: llm::Generation,
+    /// The generation values that the response echoes (`RD-29` 3.4).
+    generation_echo: GenerationEcho,
+    /// The effective `text.verbosity` (`RD-30`).
+    verbosity: Verbosity,
 }
 
 /// Validate every supported-statefulness and model choice before generation.
@@ -180,10 +199,11 @@ fn validate(request: &CreateRequest, loaded_model: &str) -> Result<PreparedPromp
         request.parallel_tool_calls,
     )
     .map_err(|message| (400, message))?;
-    let format = derive_format(request.text.as_ref()).map_err(|message| (400, message))?;
+    let text = derive_text(request.text.as_ref()).map_err(|message| (400, message))?;
+    let generation = derive_generation(request).map_err(|message| (400, message))?;
     let reasoning =
         derive_reasoning(request.reasoning.as_ref()).map_err(|message| (400, message))?;
-    if tools.offers_tools() && format.json_required {
+    if tools.offers_tools() && text.format.json_required {
         // Combining the tool envelope with a structured output format needs two
         // grammars. The route does not implement the combination, so it
         // returns a clear error instead of mishandling it (`SP-NEVER-010`).
@@ -194,19 +214,18 @@ fn validate(request: &CreateRequest, loaded_model: &str) -> Result<PreparedPromp
     }
     let (mut system, user) =
         map_input(request.instructions.as_deref(), &request.input).map_err(|err| (400, err))?;
-    if let Some(note) = tools.system_note() {
-        if !system.is_empty() {
-            system.push('\n');
-        }
-        system.push_str(&note);
-    }
-    Ok(PreparedPrompt {
-        system,
+    let prepared = PreparedPrompt {
+        system: String::new(),
         user,
-        format,
+        format: text.format,
         tools,
         reasoning,
-    })
+        generation: generation.generation,
+        generation_echo: generation.echo,
+        verbosity: text.verbosity,
+    };
+    append_system_notes(&mut system, &prepared);
+    Ok(PreparedPrompt { system, ..prepared })
 }
 
 /// `json_object` and `json_schema` require the generated text to parse as JSON
@@ -248,7 +267,7 @@ fn effective_prompt(
         items.extend(current.clone());
         let input = parse_input_items(items)?;
         let (mut system, user) = map_input(request.instructions.as_deref(), &input)?;
-        append_tools_note(&mut system, prepared);
+        append_system_notes(&mut system, prepared);
         // Only the request's own items are stored on the response record.
         return Ok(EffectivePrompt {
             system,
@@ -268,7 +287,7 @@ fn effective_prompt(
     items.extend(current);
     let input = parse_input_items(items.clone())?;
     let (mut system, user) = map_input(request.instructions.as_deref(), &input)?;
-    append_tools_note(&mut system, prepared);
+    append_system_notes(&mut system, prepared);
     Ok(EffectivePrompt {
         system,
         user,
@@ -276,14 +295,24 @@ fn effective_prompt(
     })
 }
 
-/// Append the tool transcription note to the system text (`RD-20`).
-fn append_tools_note(system: &mut String, prepared: &PreparedPrompt) {
+/// Append the tool transcription note and then the `text.verbosity` directive
+/// to the system text, in that order (`RD-20`, `RD-30` 4.3). Both use the same
+/// `\n` separator rule.
+fn append_system_notes(system: &mut String, prepared: &PreparedPrompt) {
     if let Some(note) = prepared.tools.system_note() {
-        if !system.is_empty() {
-            system.push('\n');
-        }
-        system.push_str(&note);
+        push_system_note(system, &note);
     }
+    if let Some(directive) = prepared.verbosity.directive() {
+        push_system_note(system, directive);
+    }
+}
+
+/// Append one note with a `\n` separator when the system text is not empty.
+fn push_system_note(system: &mut String, note: &str) {
+    if !system.is_empty() {
+        system.push('\n');
+    }
+    system.push_str(note);
 }
 
 /// The largest number of output items one generation can produce (`RD-23`).
@@ -428,6 +457,18 @@ pub async fn create_response(
     };
     let format = &prepared.format;
     let tools = &prepared.tools;
+    // Each echo key is present only when the request carried its field
+    // (`RD-29` 3.4, `RD-30` 4.4, `INVARIANT PH8-1`).
+    let controls = ResponseControls {
+        temperature: prepared.generation_echo.temperature,
+        top_p: prepared.generation_echo.top_p,
+        max_output_tokens: prepared.generation_echo.max_output_tokens,
+        verbosity: request
+            .text
+            .as_ref()
+            .and_then(|text| text.verbosity.as_ref())
+            .map(|_| prepared.verbosity.as_str()),
+    };
 
     // The conversation item limit is checked before generation, so the append
     // can never overflow it (RD-23).
@@ -467,6 +508,8 @@ pub async fn create_response(
             grammar: grammar.map(str::to_string),
             json_required: format.json_required,
             reasoning: prepared.reasoning.clone(),
+            generation: prepared.generation,
+            controls: controls.clone(),
             system,
             user,
             input_items,
@@ -502,6 +545,7 @@ pub async fn create_response(
         user,
         grammar,
         &prepared.reasoning.as_reasoning(),
+        &prepared.generation,
     ) {
         Ok((text, usage)) => {
             let echo = ToolEcho::from_request(tools);
@@ -515,6 +559,7 @@ pub async fn create_response(
                         &echo,
                         &request,
                         conversation_ref,
+                        &controls,
                         &usage,
                         streaming,
                     ),
@@ -526,6 +571,7 @@ pub async fn create_response(
                                 &echo,
                                 request.metadata.as_ref(),
                                 conversation_ref,
+                                &controls,
                                 &usage,
                             );
                             (sse_response(body), completed)
@@ -536,6 +582,7 @@ pub async fn create_response(
                                 &echo,
                                 request.metadata.as_ref(),
                                 conversation_ref,
+                                &controls,
                                 &usage,
                             );
                             (HttpResponse::Ok().json(body.clone()), body)
@@ -555,6 +602,7 @@ pub async fn create_response(
                     &echo,
                     &request,
                     conversation_ref,
+                    &controls,
                     &usage,
                     streaming,
                 )
@@ -582,12 +630,17 @@ pub async fn create_response(
             response
         }
         Err(err) => {
-            let status = match err.downcast_ref::<llm::LLMError>() {
-                Some(llm::LLMError::Busy) => 503,
-                _ => 500,
+            // The `max_output_tokens` context rejection is a request error, so
+            // it is HTTP 400 with its own message (`RD-29` 3.3, `PH8-04`).
+            let (status, message) = match err.downcast_ref::<llm::LLMError>() {
+                Some(llm::LLMError::Busy) => (503, format!("{:#}", err)),
+                Some(llm::LLMError::OutputTokensExceedContext(message)) => {
+                    (400, message.clone())
+                }
+                _ => (500, format!("{:#}", err)),
             };
             eprintln!("responses error: {:#}", err);
-            error_json(status, format!("{:#}", err))
+            error_json(status, message)
         }
     }
 }
@@ -600,6 +653,7 @@ fn build_text_like(
     echo: &ToolEcho,
     request: &CreateRequest,
     conversation: Option<&str>,
+    controls: &ResponseControls,
     usage: &llm::TokenUsage,
     streaming: bool,
 ) -> (HttpResponse, serde_json::Value) {
@@ -610,6 +664,7 @@ fn build_text_like(
             echo,
             request.metadata.as_ref(),
             conversation,
+            controls,
             usage,
         );
         (sse_response(body), completed)
@@ -620,6 +675,7 @@ fn build_text_like(
             echo,
             request.metadata.as_ref(),
             conversation,
+            controls,
             usage,
         );
         (HttpResponse::Ok().json(body.clone()), body)

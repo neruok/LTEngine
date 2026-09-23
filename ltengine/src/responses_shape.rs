@@ -105,10 +105,28 @@ pub(crate) fn usage_json(usage: &llm::TokenUsage) -> Value {
     })
 }
 
+/// The request-derived values that the response echoes beyond the tool echo
+/// (`RD-29` 3.4, `RD-30` 4.4).
+///
+/// A field is present only when the request carried it, so a request without
+/// the new fields keeps the pre-`PH-8a` body (`INVARIANT PH8-1`).
+#[derive(Clone, Debug, Default)]
+pub struct ResponseControls {
+    /// `temperature` echo. `None` omits the key.
+    pub temperature: Option<f64>,
+    /// `top_p` echo. `None` omits the key.
+    pub top_p: Option<f64>,
+    /// `max_output_tokens` echo. `None` omits the key.
+    pub max_output_tokens: Option<u32>,
+    /// The effective `text.verbosity`. `None` omits the `text` key.
+    pub verbosity: Option<&'static str>,
+}
+
 /// The OpenAI-shaped response object, shared by the non-streaming body and the
 /// `response.completed` and `response.in_progress` events. The `conversation`
 /// key is added only when the request named a conversation, so a request that
 /// carries none keeps the pre-`PH-6a` shape (`PH6A-14`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_response_object(
     id: &str,
     created_at: u64,
@@ -117,6 +135,7 @@ pub(crate) fn build_response_object(
     metadata: Option<&Value>,
     conversation: Option<&str>,
     echo: &ToolEcho,
+    controls: &ResponseControls,
     output: Value,
     usage: Value,
 ) -> Value {
@@ -136,6 +155,18 @@ pub(crate) fn build_response_object(
     if let Some(id) = conversation {
         object["conversation"] = json!({"id": id});
     }
+    if let Some(temperature) = controls.temperature {
+        object["temperature"] = json!(temperature);
+    }
+    if let Some(top_p) = controls.top_p {
+        object["top_p"] = json!(top_p);
+    }
+    if let Some(max_output_tokens) = controls.max_output_tokens {
+        object["max_output_tokens"] = json!(max_output_tokens);
+    }
+    if let Some(verbosity) = controls.verbosity {
+        object["text"] = json!({"verbosity": verbosity});
+    }
     object
 }
 
@@ -152,6 +183,7 @@ pub(crate) fn build_response_with_conversation(
     echo: &ToolEcho,
     metadata: Option<&Value>,
     conversation: Option<&str>,
+    controls: &ResponseControls,
     usage: &llm::TokenUsage,
 ) -> Value {
     build_response_object(
@@ -162,6 +194,7 @@ pub(crate) fn build_response_with_conversation(
         metadata,
         conversation,
         echo,
+        controls,
         output,
         usage_json(usage),
     )
@@ -403,6 +436,7 @@ pub(crate) fn build_stream_body_with_conversation(
     echo: &ToolEcho,
     metadata: Option<&Value>,
     conversation: Option<&str>,
+    controls: &ResponseControls,
     usage: &llm::TokenUsage,
 ) -> (String, Value) {
     let response_id = new_id("resp_");
@@ -416,6 +450,7 @@ pub(crate) fn build_stream_body_with_conversation(
         metadata,
         conversation,
         echo,
+        controls,
         json!([]),
         Value::Null,
     );
@@ -427,6 +462,7 @@ pub(crate) fn build_stream_body_with_conversation(
         metadata,
         conversation,
         echo,
+        controls,
         Value::Array(items.clone()),
         usage_json(usage),
     );

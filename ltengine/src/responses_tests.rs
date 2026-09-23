@@ -4,8 +4,8 @@
 use super::*;
 use crate::llm::TokenUsage;
 use crate::responses_shape::{
-    StreamOutput, build_response_with_conversation, build_stream_body_with_conversation,
-    calls_output, message_output, replay_stream_body,
+    ResponseControls, StreamOutput, build_response_with_conversation,
+    build_stream_body_with_conversation, calls_output, message_output, replay_stream_body,
 };
 
 /// The pre-`PH-6a` body shape: no conversation echo.
@@ -16,7 +16,7 @@ fn build_response(
     metadata: Option<&serde_json::Value>,
     usage: &TokenUsage,
 ) -> serde_json::Value {
-    build_response_with_conversation(model, output, echo, metadata, None, usage)
+    build_response_with_conversation(model, output, echo, metadata, None, &ResponseControls::default(), usage)
 }
 
 /// The pre-`PH-6a` stream shape: no conversation echo.
@@ -27,7 +27,7 @@ fn build_stream_body(
     metadata: Option<&serde_json::Value>,
     usage: &TokenUsage,
 ) -> (String, serde_json::Value) {
-    build_stream_body_with_conversation(model, output, echo, metadata, None, usage)
+    build_stream_body_with_conversation(model, output, echo, metadata, None, &ResponseControls::default(), usage)
 }
 use crate::responses_store::{
     ConversationRecord, FailingStore, FileStore, ResponseStore, StoredResponse, tests::TempStoreDir,
@@ -432,18 +432,225 @@ fn maps_function_call_and_output_input_items() {
 
 #[test]
 fn rejects_other_unknown_fields() {
-    // A field the route does not implement still fails with a 400. That
-    // includes the OpenAI generation parameters, which stay rejected until
-    // a phase implements them and their behavior is defined.
+    // A field the route does not implement still fails with a 400. `PH-8a`
+    // removed the generation parameters from this set.
+    assert!(serde_json::from_str::<CreateRequest>(r#"{"input":"hi","bogus":1}"#).is_err());
+}
+
+/// `PH8-01`, changed behavior: `temperature` is accepted in 0.0–2.0 and
+/// rejected outside it, naming the field.
+#[test]
+fn ph8_01_temperature_range() {
     for json in [
-        r#"{"input":"hi","bogus":1}"#,
-        r#"{"input":"hi","temperature":0.5}"#,
+        r#"{"input":"hi","temperature":0.0}"#,
+        r#"{"input":"hi","temperature":2.0}"#,
     ] {
+        let request = parse(json);
+        assert!(validate(&request, "gemma3-4b").is_ok(), "{json}");
+    }
+    for json in [
+        r#"{"input":"hi","temperature":-0.1}"#,
+        r#"{"input":"hi","temperature":2.1}"#,
+        r#"{"input":"hi","temperature":"warm"}"#,
+    ] {
+        let request = parse(json);
+        let (status, message) = validate(&request, "gemma3-4b").unwrap_err();
+        assert_eq!(status, 400, "{json}");
+        assert!(message.contains("temperature"), "{json}: {message}");
+    }
+}
+
+/// `PH8-02`, changed behavior: `top_p` is accepted in 0.0–1.0 and rejected
+/// outside it, naming the field.
+#[test]
+fn ph8_02_top_p_range() {
+    for json in [
+        r#"{"input":"hi","top_p":0.0}"#,
+        r#"{"input":"hi","top_p":1.0}"#,
+    ] {
+        let request = parse(json);
+        assert!(validate(&request, "gemma3-4b").is_ok(), "{json}");
+    }
+    for json in [
+        r#"{"input":"hi","top_p":-0.1}"#,
+        r#"{"input":"hi","top_p":1.1}"#,
+        r#"{"input":"hi","top_p":"wide"}"#,
+    ] {
+        let request = parse(json);
+        let (status, message) = validate(&request, "gemma3-4b").unwrap_err();
+        assert_eq!(status, 400, "{json}");
+        assert!(message.contains("top_p"), "{json}: {message}");
+    }
+}
+
+/// `PH8-03`, changed behavior: `max_output_tokens` accepts `1`; `0`, a
+/// negative value, a float, and a non-number are rejected, naming the field.
+#[test]
+fn ph8_03_max_output_tokens_range() {
+    let request = parse(r#"{"input":"hi","max_output_tokens":1}"#);
+    assert!(validate(&request, "gemma3-4b").is_ok());
+    for json in [
+        r#"{"input":"hi","max_output_tokens":0}"#,
+        r#"{"input":"hi","max_output_tokens":-1}"#,
+        r#"{"input":"hi","max_output_tokens":1.5}"#,
+        r#"{"input":"hi","max_output_tokens":"ten"}"#,
+    ] {
+        let request = parse(json);
+        let (status, message) = validate(&request, "gemma3-4b").unwrap_err();
+        assert_eq!(status, 400, "{json}");
+        assert!(message.contains("max_output_tokens"), "{json}: {message}");
+    }
+}
+
+/// `PH8-06`, preserved behavior: a request without the new fields is accepted,
+/// and a `null` control is the same as an absent one.
+#[test]
+fn ph8_06_absent_controls_keep_defaults() {
+    for json in [
+        r#"{"input":"hi"}"#,
+        r#"{"input":"hi","temperature":null,"top_p":null,"max_output_tokens":null}"#,
+    ] {
+        let request = parse(json);
+        let prepared = validate(&request, "gemma3-4b").expect("absent controls are valid");
+        assert_eq!(prepared.generation.temperature, 0.0, "{json}");
+        assert_eq!(prepared.generation.top_p, 0.95, "{json}");
+        assert_eq!(prepared.generation.max_output_tokens, None, "{json}");
+    }
+}
+
+/// `PH8-07`, changed behavior: an accepted `temperature` and `top_p` reach the
+/// generation value that `create_sampler` receives.
+#[test]
+fn ph8_07_generation_controls_reach_the_sampler() {
+    let request = parse(r#"{"input":"hi","temperature":0.7,"top_p":0.3}"#);
+    let prepared = validate(&request, "gemma3-4b").expect("valid controls");
+    assert_eq!(prepared.generation.temperature, 0.7);
+    assert_eq!(prepared.generation.top_p, 0.3);
+}
+
+/// `PH8-08`, changed behavior: the response echoes each generation control only
+/// when the request carried it.
+#[test]
+fn ph8_08_generation_echo_follows_the_request() {
+    let usage = TokenUsage::default();
+    let carried = ResponseControls {
+        temperature: Some(1.5),
+        top_p: Some(0.25),
+        max_output_tokens: Some(7),
+        verbosity: None,
+    };
+    let body = build_response_with_conversation(
+        "gemma3-4b",
+        message_output("x"),
+        &ToolEcho::text_only(),
+        None,
+        None,
+        &carried,
+        &usage,
+    );
+    assert_eq!(body["temperature"], 1.5);
+    assert_eq!(body["top_p"], 0.25);
+    assert_eq!(body["max_output_tokens"], 7);
+
+    let absent = build_response_with_conversation(
+        "gemma3-4b",
+        message_output("x"),
+        &ToolEcho::text_only(),
+        None,
+        None,
+        &ResponseControls::default(),
+        &usage,
+    );
+    assert!(absent.get("temperature").is_none());
+    assert!(absent.get("top_p").is_none());
+    assert!(absent.get("max_output_tokens").is_none());
+}
+
+/// `PH8-09`, changed behavior: `low`, `medium`, and `high` are accepted; any
+/// other value, and a non-string, are rejected naming `text.verbosity`.
+#[test]
+fn ph8_09_verbosity_values() {
+    for verbosity in ["low", "medium", "high"] {
+        let json = format!(r#"{{"input":"hi","text":{{"verbosity":"{verbosity}"}}}}"#);
+        let request = parse(&json);
+        assert!(validate(&request, "gemma3-4b").is_ok(), "{verbosity}");
+    }
+    for json in [
+        r#"{"input":"hi","text":{"verbosity":"loud"}}"#,
+        r#"{"input":"hi","text":{"verbosity":3}}"#,
+    ] {
+        let request = parse(json);
+        let (status, message) = validate(&request, "gemma3-4b").unwrap_err();
+        assert_eq!(status, 400, "{json}");
+        assert!(message.contains("text.verbosity"), "{json}: {message}");
+    }
+}
+
+/// `PH8-10`, changed behavior: `low` and `high` append their directive to the
+/// system text; `medium`, absent, and `null` append nothing.
+#[test]
+fn ph8_10_verbosity_directive() {
+    let low = parse(r#"{"input":"hi","text":{"verbosity":"low"}}"#);
+    let system = validate(&low, "gemma3-4b").expect("low accepted").system;
+    assert!(system.contains("Be concise."), "{system}");
+
+    let high = parse(r#"{"input":"hi","text":{"verbosity":"high"}}"#);
+    let system = validate(&high, "gemma3-4b").expect("high accepted").system;
+    assert!(system.contains("Be thorough."), "{system}");
+
+    for json in [
+        r#"{"input":"hi"}"#,
+        r#"{"input":"hi","text":{"verbosity":"medium"}}"#,
+        r#"{"input":"hi","text":{"verbosity":null}}"#,
+    ] {
+        let request = parse(json);
+        let system = validate(&request, "gemma3-4b").expect("accepted").system;
         assert!(
-            serde_json::from_str::<CreateRequest>(json).is_err(),
-            "{json}"
+            !system.contains("Be concise.") && !system.contains("Be thorough."),
+            "{json}: {system}"
         );
     }
+}
+
+/// `PH8-11`, preserved behavior: an absent `text.verbosity` adds no prompt text.
+#[test]
+fn ph8_11_absent_verbosity_keeps_the_prompt() {
+    let request = parse(r#"{"input":"hi"}"#);
+    let (expected, _) = map_input(None, &request.input).expect("input maps");
+    let system = validate(&request, "gemma3-4b").expect("accepted").system;
+    assert_eq!(system, expected);
+}
+
+/// `PH8-12`, changed behavior: the response echoes the effective verbosity only
+/// when the request carried it.
+#[test]
+fn ph8_12_verbosity_echo_follows_the_request() {
+    let usage = TokenUsage::default();
+    let carried = ResponseControls {
+        verbosity: Some("high"),
+        ..ResponseControls::default()
+    };
+    let body = build_response_with_conversation(
+        "gemma3-4b",
+        message_output("x"),
+        &ToolEcho::text_only(),
+        None,
+        None,
+        &carried,
+        &usage,
+    );
+    assert_eq!(body["text"]["verbosity"], "high");
+
+    let absent = build_response_with_conversation(
+        "gemma3-4b",
+        message_output("x"),
+        &ToolEcho::text_only(),
+        None,
+        None,
+        &ResponseControls::default(),
+        &usage,
+    );
+    assert!(absent.get("text").is_none());
 }
 
 #[test]
@@ -498,10 +705,13 @@ fn rejects_an_unsupported_schema_naming_the_field() {
 }
 
 #[test]
-fn rejects_text_verbosity_naming_the_field() {
-    // PH4A-07.
-    let request = parse(r#"{"input":"hi","text":{"verbosity":"low"}}"#);
-    let (status, message) = validate(&request, "gemma3-4b").unwrap_err();
+fn accepts_text_verbosity_naming_the_field() {
+    // PH8-09 changed PH4A-07: `low` is accepted, and an unknown value names
+    // `text.verbosity`.
+    let accepted = parse(r#"{"input":"hi","text":{"verbosity":"low"}}"#);
+    assert!(validate(&accepted, "gemma3-4b").is_ok());
+    let rejected = parse(r#"{"input":"hi","text":{"verbosity":"loud"}}"#);
+    let (status, message) = validate(&rejected, "gemma3-4b").unwrap_err();
     assert_eq!(status, 400);
     assert!(message.contains("text.verbosity"), "{message}");
 }

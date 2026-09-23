@@ -23,6 +23,86 @@ pub enum LLMError {
     Busy,
     #[error("Generation was cancelled")]
     Cancelled,
+    /// The requested `max_output_tokens` needs more context positions than the
+    /// model's training context (`RD-29` 3.3). The route maps this to HTTP 400.
+    #[error("{0}")]
+    OutputTokensExceedContext(String),
+}
+
+/// The sampler temperature that predates `RD-29`. `temp_ext(0.0, ...)` selects
+/// the greedy path.
+pub const DEFAULT_TEMPERATURE: f32 = 0.0;
+
+/// The sampler `top_p` that predates `RD-29`.
+pub const DEFAULT_TOP_P: f32 = 0.95;
+
+/// The generation controls of one request (`RD-29`).
+///
+/// [`Generation::default`] is the behavior that predates `RD-29`, so a request
+/// that carries no control keeps the current sampler and context size
+/// (`INVARIANT PH8-1`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Generation {
+    /// The `temp_ext` temperature. `0.0` is greedy.
+    pub temperature: f32,
+    /// The `top_p` entry.
+    pub top_p: f32,
+    /// The hard ceiling on generated tokens, or `None` for the `3 × prompt`
+    /// budget of `PH-1` through `PH-7`.
+    pub max_output_tokens: Option<u32>,
+}
+
+impl Default for Generation {
+    fn default() -> Self {
+        Self {
+            temperature: DEFAULT_TEMPERATURE,
+            top_p: DEFAULT_TOP_P,
+            max_output_tokens: None,
+        }
+    }
+}
+
+/// The last absolute position that the decode loop may generate.
+///
+/// The loop condition is inclusive (`while n_cur <= bound`), so the last
+/// position is one less than the exclusive ceiling. With `max_output_tokens`
+/// present, positions `P..P+M` are generated, which is exactly `M` tokens
+/// (`PH8-05`). `None` keeps the pre-`RD-29` `3 × prompt_tokens` bound.
+fn output_ceiling(prompt_tokens: i32, max_output_tokens: Option<u32>) -> i32 {
+    match max_output_tokens {
+        Some(max) => prompt_tokens
+            .saturating_add(i32::try_from(max).unwrap_or(i32::MAX))
+            .saturating_sub(1),
+        None => prompt_tokens.saturating_mul(3),
+    }
+}
+
+/// The context positions that a request needs: the exclusive ceiling plus the
+/// MTP margin (`RD-29` 3.2).
+fn context_positions(prompt_tokens: i32, max_output_tokens: Option<u32>, margin: i32) -> i32 {
+    let budget = match max_output_tokens {
+        Some(max) => prompt_tokens.saturating_add(i32::try_from(max).unwrap_or(i32::MAX)),
+        None => prompt_tokens.saturating_mul(3),
+    };
+    budget.saturating_add(margin)
+}
+
+/// The `RD-29` 3.3 rejection, or `None` when the request fits. The check needs
+/// the tokenized prompt, so it runs after tokenization.
+fn context_rejection(
+    prompt_tokens: i32,
+    max_output_tokens: Option<u32>,
+    margin: i32,
+    n_ctx_train: u32,
+) -> Option<String> {
+    let max = max_output_tokens?;
+    let needed = context_positions(prompt_tokens, Some(max), margin);
+    if i64::from(needed) > i64::from(n_ctx_train) {
+        return Some(format!(
+            "`max_output_tokens` {max} needs {needed} context positions (prompt {prompt_tokens} plus margin {margin}), but the model's training context is {n_ctx_train}"
+        ));
+    }
+    None
 }
 
 /// True when the optional cancellation flag is set (`PH-6b`, `RD-24`).
@@ -306,7 +386,7 @@ impl LLM {
     /// Run one generation and return the cleaned text with the exact token
     /// counts of RD-18, under explicit reasoning controls (`RD-28`).
     pub fn run_prompt_usage(&self, system: String, user: String) -> Result<(String, TokenUsage)>{
-        self.run_prompt_usage_grammar(system, user, None, &Reasoning::default())
+        self.run_prompt_usage_grammar(system, user, None, &Reasoning::default(), &Generation::default())
     }
 
     /// Run one generation with an optional GBNF grammar that constrains decode
@@ -319,8 +399,9 @@ impl LLM {
         user: String,
         grammar: Option<&str>,
         reasoning: &Reasoning<'_>,
+        generation: &Generation,
     ) -> Result<(String, TokenUsage)>{
-        self.run_prompt_usage_grammar_cancellable(system, user, grammar, None, reasoning)
+        self.run_prompt_usage_grammar_cancellable(system, user, grammar, None, reasoning, generation)
     }
 
     /// The same decode path with a cancellation flag (`PH-6b`, `RD-24`).
@@ -335,6 +416,7 @@ impl LLM {
         grammar: Option<&str>,
         cancel: Option<&AtomicBool>,
         reasoning: &Reasoning<'_>,
+        generation: &Generation,
     ) -> Result<(String, TokenUsage)>{
         let messages = [
             LlamaChatMessage::new("user".to_string(), format!("{system}\n\n{user}"))
@@ -367,7 +449,21 @@ impl LLM {
         // RD-18: the tokens that reach decode are the count, BOS included.
         let input_tokens = u32::try_from(tokens_list.len())
             .context("prompt token count does not fit in u32")?;
-        let ctx_size: i32 = tokens_list.len() as i32 * 3;
+        let prompt_tokens = tokens_list.len() as i32;
+        let mtp_enabled = self.mtp_model.is_some() || self.self_mtp;
+        // The MTP path reserves `mtp_n_max + 1` positions beyond the decode
+        // ceiling for its draft verification (`RD-29` 3.2).
+        let margin = if mtp_enabled { self.mtp_n_max + 1 } else { 0 };
+        if let Some(message) = context_rejection(
+            prompt_tokens,
+            generation.max_output_tokens,
+            margin,
+            self.model.n_ctx_train(),
+        ) {
+            return Err(LLMError::OutputTokensExceedContext(message).into());
+        }
+        let ceiling = output_ceiling(prompt_tokens, generation.max_output_tokens);
+        let ctx_size = context_positions(prompt_tokens, generation.max_output_tokens, margin);
         // Lock before create_context: context allocation uses GPU resources and
         // two concurrent allocations corrupt each other even before inference starts.
         // TODO: The llama bindings (or llama itself?) do not appear to be totally thread-safe
@@ -375,11 +471,19 @@ impl LLM {
         // this might need to be investigated and fixed. For now we lock and process requests
         // one at a time.
         let _lock = self.lock_prompt(cancel)?;
-        let (text, output_tokens) = if self.mtp_model.is_some() || self.self_mtp {
-            self.process_mtp(tokens_list, ctx_size, grammar, cancel, reasoning.thinking)?
+        let (text, output_tokens) = if mtp_enabled {
+            self.process_mtp(
+                tokens_list,
+                ctx_size,
+                ceiling,
+                grammar,
+                cancel,
+                reasoning.thinking,
+                generation,
+            )?
         } else {
             let mut ctx = self.create_context(ctx_size)?;
-            ctx.process(tokens_list, grammar, cancel, reasoning.thinking)?
+            ctx.process(tokens_list, ceiling, grammar, cancel, reasoning.thinking, generation)?
         };
         Ok((text, TokenUsage { input_tokens, output_tokens }))
     }
@@ -400,18 +504,20 @@ impl LLM {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn process_mtp(
         &self,
         tokens_list: Vec<LlamaToken>,
+        context_size: i32,
         output_limit: i32,
         grammar: Option<&str>,
         cancel: Option<&AtomicBool>,
         thinking: bool,
+        generation: &Generation,
     ) -> Result<(String, u32)> {
         // The draft model is the separate `--mtp-model-file` model when present,
         // and otherwise the target model's own nextn/MTP head.
         let mtp_model = self.mtp_model.as_ref().unwrap_or(&self.model);
-        let context_size = output_limit + self.mtp_n_max + 1;
         let n_ctx = NonZeroU32::new(context_size.try_into()?).context("Invalid context size")?;
         let n_rs_seq = self.mtp_n_max.max(4).try_into()?;
 
@@ -450,7 +556,7 @@ impl LLM {
         mtp.process(&batch).context("MTP draft prefill failed")?;
         mtp.begin(&tokens_list).context("MTP generation setup failed")?;
 
-        let mut sampler = create_sampler(&self.model, grammar)?;
+        let mut sampler = create_sampler(&self.model, grammar, generation)?;
         // `LlamaSampler::sample` accepts the sampled token inside llama.cpp;
         // the loop must not accept it again (PH-4a).
         let mut token = sampler.sample(mtp.target_context(), batch.n_tokens() - 1);
@@ -630,7 +736,11 @@ fn probe_mtp(
 
 /// Build the sampler chain. `grammar` prepends a GBNF grammar sampler so every
 /// sampled token follows the grammar (PH-4a, RD-19).
-fn create_sampler(model: &LlamaModel, grammar: Option<&str>) -> Result<LlamaSampler> {
+fn create_sampler(
+    model: &LlamaModel,
+    grammar: Option<&str>,
+    generation: &Generation,
+) -> Result<LlamaSampler> {
     let seq_breakers = vec![b"\n", b":", b"\"", b"*"];
     let mut samplers = Vec::with_capacity(10);
     if let Some(grammar) = grammar {
@@ -641,10 +751,10 @@ fn create_sampler(model: &LlamaModel, grammar: Option<&str>) -> Result<LlamaSamp
         LlamaSampler::dry(model, 0.0, 1.75, 2, -1, seq_breakers),
         LlamaSampler::top_k(40),
         LlamaSampler::typical(1.0, 0),
-        LlamaSampler::top_p(0.95, 0),
+        LlamaSampler::top_p(generation.top_p, 0),
         LlamaSampler::min_p(0.05, 0),
         LlamaSampler::xtc(0.0, 0.1, 0, 42),
-        LlamaSampler::temp_ext(0.0, 0.0, 1.0),
+        LlamaSampler::temp_ext(generation.temperature, 0.0, 1.0),
         LlamaSampler::dist(42),
     ]);
     Ok(LlamaSampler::chain_simple(samplers))
@@ -781,9 +891,15 @@ impl LLMContext<'_>{
     /// Decode a prompt and return the cleaned text with the number of generated
     /// token IDs, excluding the end-of-generation token (RD-18). `grammar`
     /// constrains the decode when present (PH-4a).
-    pub fn process(&mut self, tokens_list: Vec<LlamaToken>, grammar: Option<&str>, cancel: Option<&AtomicBool>, thinking: bool) -> Result<(String, u32)>{
-        // let ctx_size: i32 = tokens_list.len() as i32 * 3;
-        
+    pub fn process(
+        &mut self,
+        tokens_list: Vec<LlamaToken>,
+        output_limit: i32,
+        grammar: Option<&str>,
+        cancel: Option<&AtomicBool>,
+        thinking: bool,
+        generation: &Generation,
+    ) -> Result<(String, u32)>{
         // We use this object to submit token data for decoding
         let mut batch = LlamaBatch::new(self.ctx_size.try_into()?, 1);
 
@@ -800,12 +916,12 @@ impl LLMContext<'_>{
         let mut n_cur = batch.n_tokens();
 
         let mut decoder = encoding_rs::UTF_8.new_decoder();
-        let mut sampler = create_sampler(&self.llm.model, grammar)?;
+        let mut sampler = create_sampler(&self.llm.model, grammar, generation)?;
 
         let mut output = String::new();
         let mut usage = TokenUsage::default();
 
-        while n_cur <= self.ctx_size {
+        while n_cur <= output_limit {
             if is_cancelled(cancel) {
                 return Err(LLMError::Cancelled.into());
             }
@@ -842,9 +958,46 @@ impl LLMContext<'_>{
 #[cfg(test)]
 mod tests {
     use super::{
-        clean_output, mtp_mode, parse_nextn_layers, reasoning_kwargs, validate_mtp_n_max, MtpMode,
-        Reasoning, TokenUsage,
+        Generation, clean_output, context_positions, context_rejection, mtp_mode,
+        output_ceiling, parse_nextn_layers, reasoning_kwargs, validate_mtp_n_max, MtpMode, Reasoning,
+        TokenUsage,
     };
+
+    /// `PH8-06`, preserved behavior: with no `max_output_tokens`, the ceiling
+    /// and the context positions stay the pre-`RD-29` `3 × prompt`.
+    #[test]
+    fn ph8_06_absent_ceiling_is_three_times_the_prompt() {
+        assert_eq!(output_ceiling(100, None), 300);
+        assert_eq!(context_positions(100, None, 0), 300);
+        assert_eq!(context_positions(100, None, 4), 304);
+        assert_eq!(Generation::default().max_output_tokens, None);
+    }
+
+    /// `PH8-05`, changed behavior: the inclusive loop bound generates exactly
+    /// `max_output_tokens` positions.
+    #[test]
+    fn ph8_05_ceiling_is_one_less_than_the_exclusive_budget() {
+        assert_eq!(output_ceiling(100, Some(1)), 100);
+        assert_eq!(output_ceiling(100, Some(50)), 149);
+        assert_eq!(context_positions(100, Some(1), 0), 101);
+    }
+
+    /// `PH8-04`, changed behavior: a ceiling whose positions exceed the model's
+    /// training context is rejected, and the value is not reduced. A ceiling
+    /// that fits is accepted.
+    #[test]
+    fn ph8_04_context_rejection_names_max_output_tokens() {
+        assert_eq!(output_ceiling(100, Some(50)), 149);
+        assert_eq!(context_positions(100, Some(50), 4), 154);
+        assert!(context_rejection(100, Some(50), 0, 150).is_none());
+        let message = context_rejection(100, Some(50), 0, 149).expect("over the training context");
+        assert!(message.contains("max_output_tokens"), "{message}");
+        assert!(message.contains("150"), "{message}");
+        // The MTP margin counts toward the requirement.
+        assert!(context_rejection(100, Some(50), 4, 150).is_some());
+        // No ceiling is never rejected.
+        assert!(context_rejection(100, None, 4, 1).is_none());
+    }
 
     #[test]
     fn selects_self_mtp_only_for_a_baked_in_head() {
