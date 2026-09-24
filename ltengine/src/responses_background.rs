@@ -377,6 +377,7 @@ mod tests {
                     TokenUsage {
                         input_tokens: 3,
                         output_tokens: 2,
+                        reasoning_tokens: 0,
                     },
                 )),
                 Behavior::Fail => Err(anyhow::anyhow!("boom")),

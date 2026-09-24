@@ -488,6 +488,20 @@ fn ph8_32_reasoning_input_item_merges_its_content() {
     assert!(!user.contains("a summary"), "{user}");
 }
 
+/// `PH8-33`, changed behavior: the `usage` object carries the reasoning token
+/// detail, and the `RD-18` total identity is unchanged.
+#[test]
+fn ph8_33_usage_carries_reasoning_tokens() {
+    let usage = TokenUsage {
+        input_tokens: 5,
+        output_tokens: 9,
+        ..Default::default()
+    };
+    let json = crate::responses_shape::usage_json(&usage);
+    assert_eq!(json["output_tokens_details"]["reasoning_tokens"], 0);
+    assert_eq!(json["total_tokens"], 14);
+}
+
 /// `PH8-32`, changed behavior: the route body decoder accepts a reasoning
 /// item. This covers the `parse_body` path, which is the one the HTTP request
 /// uses.
@@ -894,6 +908,7 @@ fn response_shape_has_message_output_and_usage() {
     let usage = TokenUsage {
         input_tokens: 7,
         output_tokens: 3,
+        reasoning_tokens: 0,
     };
     let body = build_response("gemma3-4b", message_output("hello"), &ToolEcho::text_only(), None, &usage);
     assert_eq!(body["object"], "response");
@@ -940,6 +955,7 @@ fn stream_body_follows_the_rd17_order_with_increasing_sequence_numbers() {
     let usage = TokenUsage {
         input_tokens: 4,
         output_tokens: 2,
+        reasoning_tokens: 0,
     };
     let (body, _) = build_stream_body("gemma3-4b", StreamOutput::Text("hello"), &ToolEcho::text_only(), None, &usage);
     let events = parse_sse(&body);
@@ -991,6 +1007,7 @@ fn stream_body_sets_the_content_type_and_echoes_metadata() {
     let usage = TokenUsage {
         input_tokens: 1,
         output_tokens: 1,
+        reasoning_tokens: 0,
     };
     let (body, _) = build_stream_body("gemma3-4b", StreamOutput::Text("x"), &ToolEcho::text_only(), Some(&metadata), &usage);
     let events = parse_sse(&body);
@@ -1136,6 +1153,7 @@ fn replay_matches_the_create_stream() {
     let usage = TokenUsage {
         input_tokens: 4,
         output_tokens: 2,
+        reasoning_tokens: 0,
     };
     let (body, completed) = build_stream_body(
         "gemma3-4b",

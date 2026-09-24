@@ -96,12 +96,16 @@ pub(crate) fn calls_output(calls: &[ModelCall]) -> Value {
 }
 
 /// The exact `usage` object of RD-18. `total_tokens` is the exact sum of the two
-/// exact counts. No value is an estimate (`SP-NEVER-010`).
+/// exact counts. `output_tokens_details.reasoning_tokens` is the `RD-38` subset
+/// of `output_tokens`. No value is an estimate (`SP-NEVER-010`).
 pub(crate) fn usage_json(usage: &llm::TokenUsage) -> Value {
     json!({
         "input_tokens": usage.input_tokens,
         "output_tokens": usage.output_tokens,
         "total_tokens": usage.total_tokens(),
+        "output_tokens_details": {
+            "reasoning_tokens": usage.reasoning_tokens,
+        },
     })
 }
 

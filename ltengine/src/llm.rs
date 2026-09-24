@@ -115,12 +115,15 @@ fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
 /// `input_tokens` counts the token IDs of the fully chat-templated prompt,
 /// including the beginning-of-sequence token. `output_tokens` counts the
 /// generated token IDs, excluding the end-of-generation token and including the
-/// accepted MTP draft tokens and the sampled tokens. Neither field is an
-/// estimate.
+/// accepted MTP draft tokens and the sampled tokens. `reasoning_tokens` counts
+/// the generated token IDs that the reasoning-trace cleanup removed (`RD-38`);
+/// it is a subset of `output_tokens`. No field is an estimate.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// `RD-38`: the generated tokens removed with the reasoning trace.
+    pub reasoning_tokens: u32,
 }
 
 impl TokenUsage {
@@ -471,7 +474,7 @@ impl LLM {
         // this might need to be investigated and fixed. For now we lock and process requests
         // one at a time.
         let _lock = self.lock_prompt(cancel)?;
-        let (text, output_tokens) = if mtp_enabled {
+        let (text, output_tokens, reasoning_tokens) = if mtp_enabled {
             self.process_mtp(
                 tokens_list,
                 ctx_size,
@@ -485,7 +488,14 @@ impl LLM {
             let mut ctx = self.create_context(ctx_size)?;
             ctx.process(tokens_list, ceiling, grammar, cancel, reasoning.thinking, generation)?
         };
-        Ok((text, TokenUsage { input_tokens, output_tokens }))
+        Ok((
+            text,
+            TokenUsage {
+                input_tokens,
+                output_tokens,
+                reasoning_tokens,
+            },
+        ))
     }
 
     /// Acquire the prompt lock and observe the cancellation flag (`RD-24`).
@@ -514,7 +524,7 @@ impl LLM {
         cancel: Option<&AtomicBool>,
         thinking: bool,
         generation: &Generation,
-    ) -> Result<(String, u32)> {
+    ) -> Result<(String, u32, u32)> {
         // The draft model is the separate `--mtp-model-file` model when present,
         // and otherwise the target model's own nextn/MTP head.
         let mtp_model = self.mtp_model.as_ref().unwrap_or(&self.model);
@@ -644,7 +654,10 @@ impl LLM {
         eprintln!(
             "ltengine: MTP proposed {proposed} tokens, accepted {accepted_total}"
         );
-        clean_output(output, thinking).map(|text| (text, usage.output_tokens))
+        let (text, trace) = clean_output(output, thinking)?;
+        let reasoning_tokens =
+            count_reasoning_tokens(&self.model.vocab(), &trace, usage.output_tokens);
+        Ok((text, usage.output_tokens, reasoning_tokens))
     }
 }
 
@@ -790,11 +803,17 @@ fn decode_piece(decoder: &mut encoding_rs::Decoder, bytes: &[u8]) -> String {
     output
 }
 
-fn clean_output(output: String, thinking: bool) -> Result<String> {
-    let output = strip_thinking_block(output, thinking);
+/// Clean one generated answer and return the removed reasoning trace with it
+/// (`RD-38`). The trace is the `SP-NEVER-003` material that must not reach the
+/// response text.
+fn clean_output(output: String, thinking: bool) -> Result<(String, String)> {
+    let (output, mut trace) = strip_thinking_block(output, thinking);
     let output = if let Some(pos) = output.find("<channel|>") {
+        // Everything through the channel close marker is trace material.
+        trace.push_str(&output[..pos + "<channel|>".len()]);
         output[pos + "<channel|>".len()..].to_owned()
     } else if let Some(rest) = output.strip_prefix("<|channel>thought") {
+        trace.push_str("<|channel>thought");
         rest.trim_start_matches(['\n', ' ']).to_owned()
     } else {
         output
@@ -804,7 +823,18 @@ fn clean_output(output: String, thinking: bool) -> Result<String> {
     if output.is_empty() {
         anyhow::bail!("Model produced empty output");
     }
-    Ok(output)
+    Ok((output, trace))
+}
+
+/// Count the tokens of a removed reasoning trace with the loaded model
+/// tokenizer (`RD-38`). The count is clamped to the generated count, so it is
+/// always a subset of `output_tokens`.
+fn count_reasoning_tokens(vocab: &LlamaVocab<'_>, trace: &str, output_tokens: u32) -> u32 {
+    if trace.is_empty() {
+        return 0;
+    }
+    let count = vocab.tokenize(trace.as_bytes(), false, true).len();
+    u32::try_from(count).unwrap_or(u32::MAX).min(output_tokens)
 }
 
 /// Remove a reasoning trace, so it never reaches the response text
@@ -821,21 +851,28 @@ fn clean_output(output: String, thinking: bool) -> Result<String> {
 ///
 /// An unterminated leading block leaves nothing behind, and [`clean_output`]
 /// then reports the empty output.
-fn strip_thinking_block(output: String, thinking: bool) -> String {
+fn strip_thinking_block(output: String, thinking: bool) -> (String, String) {
     const OPEN: &str = "<think>";
     const CLOSE: &str = "</think>";
-    if let Some(rest) = output.trim_start().strip_prefix(OPEN) {
+    let trimmed = output.trim_start();
+    if let Some(rest) = trimmed.strip_prefix(OPEN) {
         return match rest.find(CLOSE) {
-            Some(end) => rest[end + CLOSE.len()..].trim_start().to_owned(),
-            None => String::new(),
+            Some(end) => (
+                rest[end + CLOSE.len()..].trim_start().to_owned(),
+                format!("{OPEN}{}", &rest[..end + CLOSE.len()]),
+            ),
+            None => (String::new(), trimmed.to_owned()),
         };
     }
     if thinking
         && let Some(end) = output.find(CLOSE)
     {
-        return output[end + CLOSE.len()..].trim_start().to_owned();
+        return (
+            output[end + CLOSE.len()..].trim_start().to_owned(),
+            output[..end + CLOSE.len()].to_owned(),
+        );
     }
-    output
+    (output, String::new())
 }
 
 /// Which MTP decode path `LLM::new` selects.
@@ -899,7 +936,7 @@ impl LLMContext<'_>{
         cancel: Option<&AtomicBool>,
         thinking: bool,
         generation: &Generation,
-    ) -> Result<(String, u32)>{
+    ) -> Result<(String, u32, u32)>{
         // We use this object to submit token data for decoding
         let mut batch = LlamaBatch::new(self.ctx_size.try_into()?, 1);
 
@@ -951,7 +988,10 @@ impl LLMContext<'_>{
             self.ctx.decode(&mut batch).with_context(|| "Failed to eval")?;
         }
 
-        clean_output(output, thinking).map(|text| (text, usage.output_tokens))
+        let (text, trace) = clean_output(output, thinking)?;
+        let reasoning_tokens =
+            count_reasoning_tokens(&self.llm.model.vocab(), &trace, usage.output_tokens);
+        Ok((text, usage.output_tokens, reasoning_tokens))
     }
 }
 
@@ -1019,7 +1059,11 @@ mod tests {
 
     #[test]
     fn usage_total_is_the_exact_sum_and_eog_is_not_counted() {
-        let mut usage = TokenUsage { input_tokens: 5, output_tokens: 0 };
+        let mut usage = TokenUsage {
+            input_tokens: 5,
+            output_tokens: 0,
+            ..Default::default()
+        };
         assert_eq!(usage.total_tokens(), 5);
         usage.record_output(false);
         usage.record_output(true);
@@ -1038,11 +1082,11 @@ mod tests {
     #[test]
     fn removes_gemma_thinking_output() {
         assert_eq!(
-            clean_output("<|channel>thought\nreason<channel|>answer".into(), false).unwrap(),
+            clean_output("<|channel>thought\nreason<channel|>answer".into(), false).unwrap().0,
             "answer"
         );
         assert_eq!(
-            clean_output("<|channel>thought answer<end_of_turn>".into(), false).unwrap(),
+            clean_output("<|channel>thought answer<end_of_turn>".into(), false).unwrap().0,
             "answer"
         );
     }
@@ -1052,11 +1096,11 @@ mod tests {
     #[test]
     fn removes_a_leading_thinking_block() {
         assert_eq!(
-            clean_output("<think>\nreasoning here\n</think>\nThe answer.".into(), false).unwrap(),
+            clean_output("<think>\nreasoning here\n</think>\nThe answer.".into(), false).unwrap().0,
             "The answer."
         );
         assert_eq!(
-            clean_output("<think>reasoning</think>Answer".into(), false).unwrap(),
+            clean_output("<think>reasoning</think>Answer".into(), false).unwrap().0,
             "Answer"
         );
     }
@@ -1073,7 +1117,7 @@ mod tests {
     #[test]
     fn keeps_output_without_a_thinking_block() {
         assert_eq!(
-            clean_output("plain answer".into(), false).unwrap(),
+            clean_output("plain answer".into(), false).unwrap().0,
             "plain answer"
         );
     }
@@ -1084,7 +1128,7 @@ mod tests {
     #[test]
     fn ac1_strips_a_trace_ended_by_a_bare_close_marker() {
         assert_eq!(
-            clean_output("The user asks X.\n</think>\n\nOK".into(), true).unwrap(),
+            clean_output("The user asks X.\n</think>\n\nOK".into(), true).unwrap().0,
             "OK"
         );
     }
@@ -1092,7 +1136,7 @@ mod tests {
     /// AC-2: a trace that is empty is a leading close marker.
     #[test]
     fn ac2_strips_a_leading_close_marker() {
-        assert_eq!(clean_output("</think>\n\nOK".into(), true).unwrap(), "OK");
+        assert_eq!(clean_output("</think>\n\nOK".into(), true).unwrap().0, "OK");
     }
 
     /// AC-3: a response that carries only a trace is an error, exactly as for
@@ -1106,7 +1150,7 @@ mod tests {
     #[test]
     fn ac4_strips_only_through_the_first_close_marker() {
         assert_eq!(
-            clean_output("trace</think>answer</think>more".into(), true).unwrap(),
+            clean_output("trace</think>answer</think>more".into(), true).unwrap().0,
             "answer</think>more"
         );
     }
@@ -1116,7 +1160,7 @@ mod tests {
     #[test]
     fn ac5_keeps_a_close_marker_when_thinking_was_not_requested() {
         assert_eq!(
-            clean_output("text </think> more".into(), false).unwrap(),
+            clean_output("text </think> more".into(), false).unwrap().0,
             "text </think> more"
         );
     }
@@ -1127,7 +1171,7 @@ mod tests {
     fn ac6_strips_a_leading_block_for_both_values() {
         for thinking in [false, true] {
             assert_eq!(
-                clean_output("<think>\nreasoning\n</think>\nAnswer.".into(), thinking).unwrap(),
+                clean_output("<think>\nreasoning\n</think>\nAnswer.".into(), thinking).unwrap().0,
                 "Answer."
             );
         }
