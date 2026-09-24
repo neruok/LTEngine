@@ -77,6 +77,45 @@ pub(crate) fn message_output(text: &str) -> Value {
     json!([message_item(&new_id("msg_"), "completed", Some(text))])
 }
 
+/// One `reasoning` output item (`RD-33`, `RD-40` row 9). Under the `verbatim`
+/// disposition, `content` carries the trace as one part of `part_type` and
+/// `summary` is `[]`. `encrypted_content` is `null` in every profile.
+pub(crate) fn reasoning_item(trace: &str, part_type: &str) -> Value {
+    json!({
+        "id": new_id("rs_"),
+        "type": "reasoning",
+        "status": "completed",
+        "summary": [],
+        "content": [{"type": part_type, "text": trace}],
+        "encrypted_content": null,
+    })
+}
+
+/// The `in_progress` form of a reasoning item, for the `added` event.
+fn reasoning_item_in_progress(item_id: &str) -> Value {
+    json!({
+        "id": item_id,
+        "type": "reasoning",
+        "status": "in_progress",
+        "summary": [],
+        "content": [],
+        "encrypted_content": null,
+    })
+}
+
+/// Prepend a reasoning item to an output array, so it appears before the
+/// message item (`RD-33`).
+pub(crate) fn prepend_reasoning(output: Value, reasoning: Option<&Value>) -> Value {
+    let Some(item) = reasoning else {
+        return output;
+    };
+    let mut items = vec![item.clone()];
+    if let Some(rest) = output.as_array() {
+        items.extend(rest.iter().cloned());
+    }
+    Value::Array(items)
+}
+
 /// The `output` array of one or more function calls.
 pub(crate) fn calls_output(calls: &[ModelCall]) -> Value {
     Value::Array(
@@ -335,6 +374,47 @@ fn build_events(in_progress: Value, completed: Value, items: &[Value]) -> Vec<(S
                     json!({"output_index": output_index, "item": item}),
                 );
             }
+            Some("reasoning") => {
+                let item_id = item["id"].as_str().unwrap_or_default().to_string();
+                let text = item["content"][0]["text"].as_str().unwrap_or_default();
+                push_event(
+                    &mut events,
+                    &mut sequence,
+                    "response.output_item.added",
+                    json!({
+                        "output_index": output_index,
+                        "item": reasoning_item_in_progress(&item_id),
+                    }),
+                );
+                push_event(
+                    &mut events,
+                    &mut sequence,
+                    "response.reasoning_text.delta",
+                    json!({
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "delta": text,
+                    }),
+                );
+                push_event(
+                    &mut events,
+                    &mut sequence,
+                    "response.reasoning_text.done",
+                    json!({
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "text": text,
+                    }),
+                );
+                push_event(
+                    &mut events,
+                    &mut sequence,
+                    "response.output_item.done",
+                    json!({"output_index": output_index, "item": item}),
+                );
+            }
             Some("function_call") => {
                 let item_id = item["id"].as_str().unwrap_or_default().to_string();
                 let call_id = item["call_id"].as_str().unwrap_or_default();
@@ -437,6 +517,7 @@ fn render_events(events: &[(String, Value)], starting_after: Option<u32>) -> Str
 pub(crate) fn build_stream_body_with_conversation(
     model: &str,
     output: StreamOutput<'_>,
+    reasoning: Option<&Value>,
     echo: &ToolEcho,
     metadata: Option<&Value>,
     conversation: Option<&str>,
@@ -445,7 +526,11 @@ pub(crate) fn build_stream_body_with_conversation(
 ) -> (String, Value) {
     let response_id = new_id("resp_");
     let created_at = now_secs();
-    let items = stream_items(output);
+    // The reasoning item, when present, leads the output array (`RD-33`).
+    let items = prepend_reasoning(Value::Array(stream_items(output)), reasoning)
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     let in_progress = build_response_object(
         &response_id,
         created_at,

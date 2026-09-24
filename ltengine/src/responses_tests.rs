@@ -27,7 +27,16 @@ fn build_stream_body(
     metadata: Option<&serde_json::Value>,
     usage: &TokenUsage,
 ) -> (String, serde_json::Value) {
-    build_stream_body_with_conversation(model, output, echo, metadata, None, &ResponseControls::default(), usage)
+    build_stream_body_with_conversation(
+        model,
+        output,
+        None,
+        echo,
+        metadata,
+        None,
+        &ResponseControls::default(),
+        usage,
+    )
 }
 use crate::responses_store::{
     ConversationRecord, FailingStore, FileStore, ResponseStore, StoredResponse, tests::TempStoreDir,
@@ -486,6 +495,109 @@ fn ph8_32_reasoning_input_item_merges_its_content() {
     assert!(user.contains("the trace"), "{user}");
     assert!(user.contains("the answer"), "{user}");
     assert!(!user.contains("a summary"), "{user}");
+}
+
+/// `PH8-34`, changed behavior: a reasoning item leads the output array, and
+/// the trace stays out of the message text (`SP-NEVER-003`).
+#[test]
+fn ph8_34_reasoning_item_leads_the_output() {
+    let item = crate::responses_shape::reasoning_item("the trace", "reasoning_text");
+    assert_eq!(item["type"], "reasoning");
+    assert_eq!(item["status"], "completed");
+    assert_eq!(item["summary"], serde_json::json!([]));
+    assert_eq!(item["content"][0]["type"], "reasoning_text");
+    assert_eq!(item["content"][0]["text"], "the trace");
+    assert_eq!(item["encrypted_content"], serde_json::Value::Null);
+    assert!(item["id"].as_str().unwrap().starts_with("rs_"));
+
+    let output =
+        crate::responses_shape::prepend_reasoning(message_output("answer"), Some(&item));
+    assert_eq!(output[0]["type"], "reasoning");
+    assert_eq!(output[1]["type"], "message");
+    assert_eq!(output[1]["content"][0]["text"], "answer");
+
+    // Under `omit`, no reasoning item is prepended.
+    let plain = crate::responses_shape::prepend_reasoning(message_output("answer"), None);
+    assert_eq!(plain.as_array().unwrap().len(), 1);
+}
+
+/// `PH8-35`, changed behavior: the reasoning content part type follows the
+/// profile (`RD-40` row 9).
+#[test]
+fn ph8_35_reasoning_part_type() {
+    use crate::responses_profile::ResponsesApi;
+    assert_eq!(
+        ResponsesApi::OpenResponses.reasoning_content_type(),
+        "output_text"
+    );
+    assert_eq!(ResponsesApi::Openai.reasoning_content_type(), "reasoning_text");
+    assert_eq!(
+        ResponsesApi::Deepseek.reasoning_content_type(),
+        "reasoning_text"
+    );
+}
+
+/// `PH8-36`, changed behavior: the streamed reasoning group precedes the
+/// message group, sequence numbers increase, and the trace is carried by the
+/// reasoning events only.
+#[test]
+fn ph8_36_stream_reasoning_group_precedes_the_message() {
+    let usage = TokenUsage {
+        input_tokens: 1,
+        output_tokens: 1,
+        reasoning_tokens: 1,
+    };
+    let item = crate::responses_shape::reasoning_item("the trace", "reasoning_text");
+    let (body, _) = build_stream_body_with_conversation(
+        "gemma3-4b",
+        StreamOutput::Text("answer"),
+        Some(&item),
+        &ToolEcho::text_only(),
+        None,
+        None,
+        &ResponseControls::default(),
+        &usage,
+    );
+
+    let events: Vec<(String, serde_json::Value)> = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|data| serde_json::from_str(data).expect("event data is JSON"))
+        .map(|value: serde_json::Value| {
+            (
+                value["type"].as_str().unwrap_or_default().to_string(),
+                value,
+            )
+        })
+        .collect();
+    let types: Vec<&str> = events.iter().map(|(kind, _)| kind.as_str()).collect();
+    assert_eq!(
+        &types[..6],
+        &[
+            "response.created",
+            "response.in_progress",
+            "response.output_item.added",
+            "response.reasoning_text.delta",
+            "response.reasoning_text.done",
+            "response.output_item.done",
+        ]
+    );
+    let numbers: Vec<u64> = events
+        .iter()
+        .map(|(_, value)| value["sequence_number"].as_u64().unwrap())
+        .collect();
+    assert!(numbers.windows(2).all(|pair| pair[1] > pair[0]), "{numbers:?}");
+
+    let reasoning_delta = events
+        .iter()
+        .find(|(kind, _)| kind == "response.reasoning_text.delta")
+        .expect("a reasoning delta");
+    assert_eq!(reasoning_delta.1["delta"], "the trace");
+    let text_delta = events
+        .iter()
+        .find(|(kind, _)| kind == "response.output_text.delta")
+        .expect("a text delta");
+    assert_eq!(text_delta.1["delta"], "answer");
 }
 
 /// `PH8-33`, changed behavior: the `usage` object carries the reasoning token

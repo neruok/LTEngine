@@ -173,6 +173,8 @@ fn output_item_as_input(item: &serde_json::Value) -> Option<serde_json::Value> {
             "name": item["name"],
             "arguments": item["arguments"],
         })),
+        // A stored reasoning item round-trips as input (`RD-39`).
+        Some("reasoning") => Some(item.clone()),
         _ => None,
     }
 }

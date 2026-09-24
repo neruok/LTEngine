@@ -390,6 +390,7 @@ impl LLM {
     /// counts of RD-18, under explicit reasoning controls (`RD-28`).
     pub fn run_prompt_usage(&self, system: String, user: String) -> Result<(String, TokenUsage)>{
         self.run_prompt_usage_grammar(system, user, None, &Reasoning::default(), &Generation::default())
+            .map(|(text, _trace, usage)| (text, usage))
     }
 
     /// Run one generation with an optional GBNF grammar that constrains decode
@@ -403,7 +404,7 @@ impl LLM {
         grammar: Option<&str>,
         reasoning: &Reasoning<'_>,
         generation: &Generation,
-    ) -> Result<(String, TokenUsage)>{
+    ) -> Result<(String, String, TokenUsage)>{
         self.run_prompt_usage_grammar_cancellable(system, user, grammar, None, reasoning, generation)
     }
 
@@ -420,7 +421,7 @@ impl LLM {
         cancel: Option<&AtomicBool>,
         reasoning: &Reasoning<'_>,
         generation: &Generation,
-    ) -> Result<(String, TokenUsage)>{
+    ) -> Result<(String, String, TokenUsage)>{
         let messages = [
             LlamaChatMessage::new("user".to_string(), format!("{system}\n\n{user}"))
                 .context("Failed to build chat message")?
@@ -474,7 +475,7 @@ impl LLM {
         // this might need to be investigated and fixed. For now we lock and process requests
         // one at a time.
         let _lock = self.lock_prompt(cancel)?;
-        let (text, output_tokens, reasoning_tokens) = if mtp_enabled {
+        let (text, trace, output_tokens, reasoning_tokens) = if mtp_enabled {
             self.process_mtp(
                 tokens_list,
                 ctx_size,
@@ -490,6 +491,7 @@ impl LLM {
         };
         Ok((
             text,
+            trace,
             TokenUsage {
                 input_tokens,
                 output_tokens,
@@ -524,7 +526,7 @@ impl LLM {
         cancel: Option<&AtomicBool>,
         thinking: bool,
         generation: &Generation,
-    ) -> Result<(String, u32, u32)> {
+    ) -> Result<(String, String, u32, u32)> {
         // The draft model is the separate `--mtp-model-file` model when present,
         // and otherwise the target model's own nextn/MTP head.
         let mtp_model = self.mtp_model.as_ref().unwrap_or(&self.model);
@@ -657,7 +659,7 @@ impl LLM {
         let (text, trace) = clean_output(output, thinking)?;
         let reasoning_tokens =
             count_reasoning_tokens(&self.model.vocab(), &trace, usage.output_tokens);
-        Ok((text, usage.output_tokens, reasoning_tokens))
+        Ok((text, trace, usage.output_tokens, reasoning_tokens))
     }
 }
 
@@ -936,7 +938,7 @@ impl LLMContext<'_>{
         cancel: Option<&AtomicBool>,
         thinking: bool,
         generation: &Generation,
-    ) -> Result<(String, u32, u32)>{
+    ) -> Result<(String, String, u32, u32)>{
         // We use this object to submit token data for decoding
         let mut batch = LlamaBatch::new(self.ctx_size.try_into()?, 1);
 
@@ -991,7 +993,7 @@ impl LLMContext<'_>{
         let (text, trace) = clean_output(output, thinking)?;
         let reasoning_tokens =
             count_reasoning_tokens(&self.llm.model.vocab(), &trace, usage.output_tokens);
-        Ok((text, usage.output_tokens, reasoning_tokens))
+        Ok((text, trace, usage.output_tokens, reasoning_tokens))
     }
 }
 

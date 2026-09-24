@@ -12,6 +12,15 @@ use clap::ValueEnum;
 
 use crate::llm::{DEFAULT_TEMPERATURE, DEFAULT_TOP_P, Generation};
 
+/// The raw reasoning trace disposition (`RD-33`, `RD-40` row 1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ReasoningTrace {
+    /// Surface the loaded model's own trace as a `reasoning` output item.
+    Verbatim,
+    /// Do not surface the trace (`content` stays `null`).
+    Omit,
+}
+
 /// The Responses API compatibility profile (`RD-40`).
 ///
 /// `clap` derives the command-line values `openai`, `deepseek`, and
@@ -35,6 +44,25 @@ impl ResponsesApi {
     /// error in every profile.
     pub fn ignores_unsupported_fields(self) -> bool {
         matches!(self, Self::Deepseek)
+    }
+
+    /// `RD-40` row 1: the profile default for the raw trace. The operator
+    /// `--reasoning-trace` value overrides it. `openai` and `open-responses`
+    /// keep `omit`, so a trace is surfaced only on an explicit operator opt-in
+    /// (`SP-NEVER-003`); `deepseek` returns the trace as its API does.
+    pub fn reasoning_trace(self) -> ReasoningTrace {
+        match self {
+            Self::Deepseek => ReasoningTrace::Verbatim,
+            Self::Openai | Self::OpenResponses => ReasoningTrace::Omit,
+        }
+    }
+
+    /// `RD-40` row 9: the reasoning content part type.
+    pub fn reasoning_content_type(self) -> &'static str {
+        match self {
+            Self::OpenResponses => "output_text",
+            Self::Openai | Self::Deepseek => "reasoning_text",
+        }
     }
 
     /// `RD-40` row 3: the value that reaches the chat template for an accepted
@@ -127,5 +155,30 @@ mod tests {
         assert!(ResponsesApi::Deepseek.ignores_unsupported_fields());
         assert!(!ResponsesApi::Openai.ignores_unsupported_fields());
         assert!(!ResponsesApi::OpenResponses.ignores_unsupported_fields());
+    }
+
+    /// `PH8-37`: the profile default for the raw trace is `omit` except under
+    /// `deepseek`, and the operator option overrides it.
+    #[test]
+    fn ph8_37_profile_defaults_the_reasoning_trace() {
+        use super::ReasoningTrace;
+        assert_eq!(ResponsesApi::Openai.reasoning_trace(), ReasoningTrace::Omit);
+        assert_eq!(
+            ResponsesApi::OpenResponses.reasoning_trace(),
+            ReasoningTrace::Omit
+        );
+        assert_eq!(
+            ResponsesApi::Deepseek.reasoning_trace(),
+            ReasoningTrace::Verbatim
+        );
+    }
+
+    /// `PH8-35`: the reasoning content part type is `output_text` under
+    /// `open-responses` and `reasoning_text` under the other profiles.
+    #[test]
+    fn ph8_35_reasoning_content_part_type() {
+        assert_eq!(ResponsesApi::OpenResponses.reasoning_content_type(), "output_text");
+        assert_eq!(ResponsesApi::Openai.reasoning_content_type(), "reasoning_text");
+        assert_eq!(ResponsesApi::Deepseek.reasoning_content_type(), "reasoning_text");
     }
 }

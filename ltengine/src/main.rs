@@ -100,7 +100,11 @@ struct Args {
 
     /// Responses API compatibility profile (RD-40). Required; no default.
     #[arg(long = "responses-api", value_enum)]
-    responses_api: responses_profile::ResponsesApi
+    responses_api: responses_profile::ResponsesApi,
+
+    /// Raw reasoning trace disposition (RD-33). The profile sets the default.
+    #[arg(long = "reasoning-trace", value_enum)]
+    reasoning_trace: Option<responses_profile::ReasoningTrace>
 }
 
 #[derive(Debug, Deserialize, Serialize)]

@@ -16,10 +16,11 @@ use serde_json::{Value, json};
 use crate::Args;
 use crate::llm::{self, TokenUsage};
 use crate::responses_http::{error_json, not_found, strict_guard};
+use crate::responses_profile::ReasoningTrace;
 use crate::responses_reasoning::ReasoningEffect;
 use crate::responses_shape::{
     ResponseControls, build_response_object, calls_output, message_output, new_id, now_secs,
-    usage_json,
+    prepend_reasoning, reasoning_item, usage_json,
 };
 use crate::responses_store::{AppStore, ConversationRecord, StoredResponse};
 use crate::responses_tools::{ModelTurn, ToolEcho, ToolRequest, parse_turn};
@@ -34,7 +35,7 @@ pub(crate) trait Generate: Send + Sync {
         reasoning: ReasoningEffect,
         generation: llm::Generation,
         cancel: Arc<AtomicBool>,
-    ) -> anyhow::Result<(String, TokenUsage)>;
+    ) -> anyhow::Result<(String, String, TokenUsage)>;
 }
 
 impl Generate for llm::LLM {
@@ -46,7 +47,7 @@ impl Generate for llm::LLM {
         reasoning: ReasoningEffect,
         generation: llm::Generation,
         cancel: Arc<AtomicBool>,
-    ) -> anyhow::Result<(String, TokenUsage)> {
+    ) -> anyhow::Result<(String, String, TokenUsage)> {
         self.run_prompt_usage_grammar_cancellable(
             system,
             user,
@@ -118,6 +119,10 @@ pub(crate) struct BackgroundRequest {
     /// The response echo of the generation controls and verbosity (`RD-29`,
     /// `RD-30`).
     pub controls: ResponseControls,
+    /// The effective raw-trace disposition (`RD-33`, `RD-40` row 1).
+    pub reasoning_trace: ReasoningTrace,
+    /// The reasoning content part type (`RD-40` row 9).
+    pub reasoning_part_type: &'static str,
     pub system: String,
     pub user: String,
     pub input_items: Vec<Value>,
@@ -212,22 +217,33 @@ impl BackgroundJob {
             Arc::clone(&cancel),
         );
         let completed = match result {
-            Ok((text, usage)) if !cancel.load(Ordering::Relaxed) => match output_items(&text, &request)
-            {
-                Some(output) => build_response_object(
-                    &id,
-                    created_at,
-                    "completed",
-                    &request.model,
-                    request.metadata.as_ref(),
-                    request.conversation.as_deref(),
-                    &request.echo,
-                    &request.controls,
-                    output,
-                    usage_json(&usage),
-                ),
-                None => object_for(&id, created_at, "failed", &request, json!([])),
-            },
+            Ok((text, trace, usage)) if !cancel.load(Ordering::Relaxed) => {
+                match output_items(&text, &request) {
+                    Some(output) => {
+                        let reasoning = if request.reasoning_trace
+                            == ReasoningTrace::Verbatim
+                            && !trace.is_empty()
+                        {
+                            Some(reasoning_item(&trace, request.reasoning_part_type))
+                        } else {
+                            None
+                        };
+                        build_response_object(
+                            &id,
+                            created_at,
+                            "completed",
+                            &request.model,
+                            request.metadata.as_ref(),
+                            request.conversation.as_deref(),
+                            &request.echo,
+                            &request.controls,
+                            prepend_reasoning(output, reasoning.as_ref()),
+                            usage_json(&usage),
+                        )
+                    }
+                    None => object_for(&id, created_at, "failed", &request, json!([])),
+                }
+            }
             Ok(_) => object_for(&id, created_at, "cancelled", &request, json!([])),
             Err(err) if is_cancelled_error(&err) => {
                 object_for(&id, created_at, "cancelled", &request, json!([]))
@@ -370,10 +386,11 @@ mod tests {
             _reasoning: ReasoningEffect,
             _generation: llm::Generation,
             cancel: Arc<AtomicBool>,
-        ) -> anyhow::Result<(String, TokenUsage)> {
+        ) -> anyhow::Result<(String, String, TokenUsage)> {
             match &self.behavior {
                 Behavior::Message(text) => Ok((
                     text.clone(),
+                    String::new(),
                     TokenUsage {
                         input_tokens: 3,
                         output_tokens: 2,
@@ -404,6 +421,8 @@ mod tests {
             reasoning: ReasoningEffect::default(),
             generation: llm::Generation::default(),
             controls: ResponseControls::default(),
+            reasoning_trace: ReasoningTrace::Omit,
+            reasoning_part_type: "reasoning_text",
             system: String::new(),
             user: "hi".to_string(),
             input_items: Vec::new(),

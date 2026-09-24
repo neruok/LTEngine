@@ -30,12 +30,13 @@ use crate::responses_input::{
     ResponseInput, input_items, map_input, output_items_as_input, parse_input_items,
     stored_items_as_input,
 };
-use crate::responses_profile::ResponsesApi;
+use crate::responses_profile::{ReasoningTrace, ResponsesApi};
 use crate::responses_reasoning::{ReasoningEffect, ResponseReasoning, derive_reasoning};
 use crate::responses_schema::{ResponseTextConfig, StructuredFormat, Verbosity, derive_text};
 use crate::responses_shape::{
     ResponseControls, StreamOutput, build_response_with_conversation,
-    build_stream_body_with_conversation, calls_output, message_output,
+    build_stream_body_with_conversation, calls_output, message_output, prepend_reasoning,
+    reasoning_item,
 };
 use crate::responses_store::{AppStore, ConversationRecord, ResponseStore, StoredResponse};
 use crate::responses_tools::{ModelTurn, ToolEcho, ToolRequest, parse_tools, parse_turn};
@@ -551,6 +552,11 @@ pub async fn create_response(
             .and_then(|text| text.verbosity.as_ref())
             .map(|_| prepared.verbosity.as_str()),
     };
+    // The operator option overrides the profile default (`RD-40` row 1).
+    let trace_mode = args
+        .reasoning_trace
+        .unwrap_or(args.responses_api.reasoning_trace());
+    let reasoning_part_type = args.responses_api.reasoning_content_type();
 
     // The conversation item limit is checked before generation, so the append
     // can never overflow it (RD-23).
@@ -592,6 +598,8 @@ pub async fn create_response(
             reasoning: prepared.reasoning.clone(),
             generation: prepared.generation,
             controls: controls.clone(),
+            reasoning_trace: trace_mode,
+            reasoning_part_type,
             system,
             user,
             input_items,
@@ -629,15 +637,24 @@ pub async fn create_response(
         &prepared.reasoning.as_reasoning(),
         &prepared.generation,
     ) {
-        Ok((text, usage)) => {
+        Ok((text, trace, usage)) => {
             let echo = ToolEcho::from_request(tools);
             let conversation_ref = conversation_id.as_deref();
+            // The reasoning item appears only under `verbatim` and only when a
+            // trace was generated (`RD-33`, `RD-34`, `SP-NEVER-003`).
+            let reasoning = if trace_mode == ReasoningTrace::Verbatim && !trace.is_empty() {
+                Some(reasoning_item(&trace, reasoning_part_type))
+            } else {
+                None
+            };
+            let reasoning_ref = reasoning.as_ref();
             let (response, completed) = if tools.offers_tools() {
                 // The model answers with the transcription envelope (RD-20).
                 match parse_turn(&text, tools) {
                     Ok(ModelTurn::Message(answer)) => build_text_like(
                         &loaded_model,
                         &answer,
+                        reasoning_ref,
                         &echo,
                         &request,
                         conversation_ref,
@@ -650,6 +667,7 @@ pub async fn create_response(
                             let (body, completed) = build_stream_body_with_conversation(
                                 &loaded_model,
                                 StreamOutput::Calls(&calls),
+                                reasoning_ref,
                                 &echo,
                                 request.metadata.as_ref(),
                                 conversation_ref,
@@ -660,7 +678,7 @@ pub async fn create_response(
                         } else {
                             let body = build_response_with_conversation(
                                 &loaded_model,
-                                calls_output(&calls),
+                                prepend_reasoning(calls_output(&calls), reasoning_ref),
                                 &echo,
                                 request.metadata.as_ref(),
                                 conversation_ref,
@@ -681,6 +699,7 @@ pub async fn create_response(
                 build_text_like(
                     &loaded_model,
                     &text,
+                    reasoning_ref,
                     &echo,
                     &request,
                     conversation_ref,
@@ -732,6 +751,7 @@ pub async fn create_response(
 fn build_text_like(
     model: &str,
     text: &str,
+    reasoning: Option<&serde_json::Value>,
     echo: &ToolEcho,
     request: &CreateRequest,
     conversation: Option<&str>,
@@ -743,6 +763,7 @@ fn build_text_like(
         let (body, completed) = build_stream_body_with_conversation(
             model,
             StreamOutput::Text(text),
+            reasoning,
             echo,
             request.metadata.as_ref(),
             conversation,
@@ -753,7 +774,7 @@ fn build_text_like(
     } else {
         let body = build_response_with_conversation(
             model,
-            message_output(text),
+            prepend_reasoning(message_output(text), reasoning),
             echo,
             request.metadata.as_ref(),
             conversation,
